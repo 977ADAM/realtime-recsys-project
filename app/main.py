@@ -164,7 +164,7 @@ async def get_reco(
     )
     items = await anyio.to_thread.run_sync(rank_candidates, user_id, candidates, k)
 
-    if x_autolog_impressions:
+    if x_autolog_impressions and items:
         imp_evt = ImpressionEvent(
             user_id=user_id,
             session_id=session_id,
@@ -187,6 +187,11 @@ async def get_reco(
                 "Skipping auto-log impressions for request_id=%s because kafka is unavailable",
                 req_id,
             )
+    elif x_autolog_impressions:
+        logger.debug(
+            "Skipping auto-log impressions for request_id=%s because recommendation list is empty",
+            req_id,
+        )
 
     return RecoResponse(
         request_id=req_id,
