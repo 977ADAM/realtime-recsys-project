@@ -7,7 +7,7 @@ from psycopg.rows import dict_row
 
 try:
     from psycopg_pool import ConnectionPool
-except ImportError:  # optional dependency
+except ImportError:
     ConnectionPool = None
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/recsys")
