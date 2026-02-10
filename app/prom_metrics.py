@@ -97,30 +97,6 @@ RECO_REQUEST_LATENCY_MS = Histogram(
     buckets=_LAG_BUCKETS_MS,
 )
 
-WORKER_RUNNING = Gauge(
-    "reco_worker_running",
-    "Kafka worker process state (1 running, 0 stopped).",
-)
-
-WORKER_PROCESSED_TOTAL = Counter(
-    "reco_worker_processed_total",
-    "Total successfully processed Kafka events by topic.",
-    labelnames=("topic",),
-)
-
-WORKER_CONSUMER_LAG_MS = Histogram(
-    "reco_worker_consumer_lag_ms",
-    "Consumer lag in milliseconds measured as processing_time - message_timestamp.",
-    labelnames=("topic",),
-    buckets=_LAG_BUCKETS_MS,
-)
-
-WORKER_DLQ_TOTAL = Counter(
-    "reco_worker_dlq_total",
-    "Total events moved to DLQ by source topic and error type.",
-    labelnames=("topic", "error_type"),
-)
-
 WATCH_EVENT_TO_FEATURE_LATENCY_MS = Histogram(
     "reco_watch_event_to_feature_latency_ms",
     "Latency from client event timestamp to successful online feature update.",
@@ -132,21 +108,6 @@ def observe_reco_request(latency_ms: float, status_code: int) -> None:
     status_family = f"{max(status_code, 0) // 100}xx"
     RECO_REQUEST_TOTAL.labels(status_family=status_family).inc()
     RECO_REQUEST_LATENCY_MS.observe(max(float(latency_ms), 0.0))
-
-
-def set_worker_running(is_running: bool) -> None:
-    WORKER_RUNNING.set(1.0 if is_running else 0.0)
-
-
-def observe_worker_processed(topic: str, lag_ms: Optional[float]) -> None:
-    WORKER_PROCESSED_TOTAL.labels(topic=topic).inc()
-    if lag_ms is not None:
-        WORKER_CONSUMER_LAG_MS.labels(topic=topic).observe(max(float(lag_ms), 0.0))
-
-
-def observe_worker_dlq(topic: str, error_type: str) -> None:
-    error_label = error_type or "unknown"
-    WORKER_DLQ_TOTAL.labels(topic=topic, error_type=error_label).inc()
 
 
 def observe_watch_event_to_feature_latency(latency_ms: float) -> None:
@@ -163,7 +124,7 @@ def prometheus_content_type() -> str:
     return CONTENT_TYPE_LATEST
 
 
-def start_worker_metrics_http_server() -> bool:
+def start_metrics_http_server() -> bool:
     if not _env_bool("PROMETHEUS_METRICS_ENABLED", True):
         logger.info("Prometheus metrics server is disabled by config")
         return False
@@ -172,8 +133,8 @@ def start_worker_metrics_http_server() -> bool:
         logger.warning("prometheus_client is not installed; metrics server is disabled")
         return False
 
-    host = os.getenv("WORKER_METRICS_HOST", "0.0.0.0")
-    port = _positive_int_env("WORKER_METRICS_PORT", 9108)
+    host = os.getenv("METRICS_HOST", "0.0.0.0")
+    port = _positive_int_env("METRICS_PORT", 9108)
     start_http_server(port=port, addr=host)
-    logger.info("Worker metrics server started at http://%s:%s/metrics", host, port)
+    logger.info("Metrics server started at http://%s:%s/metrics", host, port)
     return True

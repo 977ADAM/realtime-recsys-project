@@ -1,59 +1,71 @@
-import os
-import uuid
 import logging
+import os
 import time
-import anyio
+import uuid
 from typing import Optional
+
+import anyio
 from fastapi import FastAPI, Header, HTTPException, Query, Request, Response
 
 if __package__:
     from .config import contract_snapshot
-    from .schemas import (
-        Event,
-        RecommendResponse,
-        ImpressionEvent,
-        ImpressionItem,
-        WatchEvent,
-        RecoResponse,
-        Context,
-        EventBatch,
+    from .db import (
+        close_pool,
+        get_baseline_kpi_snapshot,
+        init_db,
+        persist_impression_event,
+        persist_watch_event_and_update_features,
     )
-    from .store import FeatureStore
-    from .recommend import recommend
-    from .ranking import rank_items_by_features
-    from .db import close_pool, get_baseline_kpi_snapshot, init_db
-    from .kafka import KafkaConsumerWorker, KafkaPublisher, now_ms
     from .observability import RecoMetricsWindow
     from .prom_metrics import (
         observe_reco_request,
         prometheus_content_type,
         prometheus_payload,
     )
-else:  # pragma: no cover - fallback for direct script execution
-    from config import contract_snapshot
-    from schemas import (
+    from .ranking import rank_items_by_features
+    from .recommend import recommend
+    from .schemas import (
+        Context,
         Event,
-        RecommendResponse,
+        EventBatch,
         ImpressionEvent,
         ImpressionItem,
-        WatchEvent,
         RecoResponse,
-        Context,
-        EventBatch,
+        RecommendResponse,
+        WatchEvent,
     )
-    from store import FeatureStore
-    from recommend import recommend
-    from ranking import rank_items_by_features
-    from db import close_pool, get_baseline_kpi_snapshot, init_db
-    from kafka import KafkaConsumerWorker, KafkaPublisher, now_ms
+    from .store import FeatureStore
+else:  # pragma: no cover - fallback for direct script execution
+    from config import contract_snapshot
+    from db import (
+        close_pool,
+        get_baseline_kpi_snapshot,
+        init_db,
+        persist_impression_event,
+        persist_watch_event_and_update_features,
+    )
     from observability import RecoMetricsWindow
     from prom_metrics import (
         observe_reco_request,
         prometheus_content_type,
         prometheus_payload,
     )
+    from ranking import rank_items_by_features
+    from recommend import recommend
+    from schemas import (
+        Context,
+        Event,
+        EventBatch,
+        ImpressionEvent,
+        ImpressionItem,
+        RecoResponse,
+        RecommendResponse,
+        WatchEvent,
+    )
+    from store import FeatureStore
 
-APP_NAME = "Real-time Recommender MVP + reco-logger"
+
+APP_NAME = "Real-time Recommender MVP"
 
 app = FastAPI(title=APP_NAME)
 logger = logging.getLogger(__name__)
@@ -66,35 +78,34 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
-API_EMBEDDED_WORKER_ENABLED = _env_bool("API_EMBEDDED_WORKER_ENABLED", False)
+def now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+DB_INIT_ON_STARTUP = _env_bool("DB_INIT_ON_STARTUP", True)
 
 store = FeatureStore()
-publisher = KafkaPublisher()
-worker = KafkaConsumerWorker(enabled=API_EMBEDDED_WORKER_ENABLED)
 reco_metrics = RecoMetricsWindow()
 
 
 @app.on_event("startup")
 async def startup():
-    # Initialize DB schema (sync) without blocking the event loop
-    await anyio.to_thread.run_sync(init_db)
+    if not DB_INIT_ON_STARTUP:
+        logger.info("DB init on startup is disabled; set DB_INIT_ON_STARTUP=true to auto-apply schema")
+        return
+
     try:
-        await publisher.start()
-    except Exception:
-        logger.exception("Kafka is unavailable at startup; recommendation endpoints will stay online")
-    if API_EMBEDDED_WORKER_ENABLED:
-        try:
-            await worker.start()
-        except Exception:
-            logger.exception("Embedded Kafka consumer worker failed at startup; API will keep serving")
-    else:
-        logger.info("Embedded worker is disabled; run `python -m app.worker_main` as a separate service")
+        await anyio.to_thread.run_sync(init_db)
+    except Exception as exc:
+        logger.warning(
+            "Postgres is unavailable at startup; DB-backed endpoints may fail until DB is restored (%s: %s)",
+            exc.__class__.__name__,
+            exc,
+        )
+
 
 @app.on_event("shutdown")
 async def shutdown():
-    if API_EMBEDDED_WORKER_ENABLED:
-        await worker.stop()
-    await publisher.stop()
     close_pool()
 
 
@@ -135,15 +146,6 @@ def get_contract():
     return contract_snapshot()
 
 
-@app.get("/stream/worker")
-def stream_worker_status():
-    snapshot = worker.snapshot()
-    snapshot["mode"] = "embedded" if API_EMBEDDED_WORKER_ENABLED else "external"
-    if not API_EMBEDDED_WORKER_ENABLED:
-        snapshot["note"] = "Worker is expected to run as a separate process (`python -m app.worker_main`)."
-    return snapshot
-
-
 @app.get("/metrics/reco")
 def reco_metrics_snapshot():
     return reco_metrics.snapshot()
@@ -176,7 +178,6 @@ def get_recommend(user_id: str, k: int = Query(default=10, ge=1, le=200)):
 
 
 def new_request_id() -> str:
-    # uuid4 is fine; you can switch to ULID if you prefer sortable ids
     return uuid.uuid4().hex
 
 
@@ -191,28 +192,43 @@ def rank_candidates(user_id: str, candidates: list[str], k: int) -> list[str]:
     features = store.get_features_for_ranking(user_id=user_id, item_ids=candidates)
     return rank_items_by_features(candidates=candidates, features=features, k=k)
 
+
+async def _persist_impression(evt: ImpressionEvent) -> int:
+    return await anyio.to_thread.run_sync(persist_impression_event, evt)
+
+
+async def _persist_watch(evt: WatchEvent) -> dict:
+    return await anyio.to_thread.run_sync(persist_watch_event_and_update_features, evt)
+
+
 @app.post("/log/impression")
 async def log_impression(evt: ImpressionEvent):
-    if len(evt.items) == 0:
-        raise HTTPException(status_code=400, detail="items must be non-empty")
-    if not publisher.is_ready:
-        raise HTTPException(status_code=503, detail="kafka is unavailable")
+    payload = evt.model_copy(update={"server_received_ts_ms": now_ms()})
     try:
-        await publisher.publish_impression(evt)
+        inserted_rows = await _persist_impression(payload)
     except Exception as exc:
-        raise HTTPException(status_code=503, detail="failed to publish impression event") from exc
-    return {"status": "ok"}
+        raise HTTPException(status_code=503, detail="failed to persist impression event") from exc
+
+    return {
+        "status": "ok" if inserted_rows > 0 else "duplicate",
+        "inserted_rows": inserted_rows,
+        "mode": "direct_db",
+    }
 
 
 @app.post("/log/watch")
 async def log_watch(evt: WatchEvent):
-    if not publisher.is_ready:
-        raise HTTPException(status_code=503, detail="kafka is unavailable")
+    payload = evt.model_copy(update={"server_received_ts_ms": now_ms()})
     try:
-        await publisher.publish_watch(evt)
+        persist_result = await _persist_watch(payload)
     except Exception as exc:
-        raise HTTPException(status_code=503, detail="failed to publish watch event") from exc
-    return {"status": "ok"}
+        raise HTTPException(status_code=503, detail="failed to persist watch event") from exc
+
+    return {
+        "status": "ok" if persist_result.get("inserted_watch") else "duplicate",
+        "feature_updated": bool(persist_result.get("feature_updated")),
+        "mode": "direct_db",
+    }
 
 
 @app.get("/reco", response_model=RecoResponse)
@@ -240,19 +256,14 @@ async def get_reco(
             items=[ImpressionItem(item_id=item, position=pos) for pos, item in enumerate(items)],
             context=Context(user_agent=user_agent),
         )
-        if publisher.is_ready:
-            try:
-                await publisher.publish_impression(imp_evt)
-            except Exception:
-                logger.exception(
-                    "Failed to auto-log impressions for request_id=%s user_id=%s",
-                    req_id,
-                    user_id,
-                )
-        else:
-            logger.warning(
-                "Skipping auto-log impressions for request_id=%s because kafka is unavailable",
+        payload = imp_evt.model_copy(update={"server_received_ts_ms": now_ms()})
+        try:
+            await _persist_impression(payload)
+        except Exception:
+            logger.exception(
+                "Failed to auto-log impressions for request_id=%s user_id=%s",
                 req_id,
+                user_id,
             )
     elif x_autolog_impressions:
         logger.debug(
@@ -267,12 +278,24 @@ async def get_reco(
         strategy="co_vis_popularity_hybrid",
     )
 
+
 @app.post("/log/batch")
 async def log_batch(batch: EventBatch):
-    if not publisher.is_ready:
-        raise HTTPException(status_code=503, detail="kafka is unavailable")
+    inserted_events = 0
     try:
-        await publisher.publish_batch(batch.events)
+        for event in batch.events:
+            payload = event.model_copy(update={"server_received_ts_ms": now_ms()})
+            if event.event_type == "impression":
+                inserted_events += int(await _persist_impression(payload) > 0)
+            else:
+                watch_result = await _persist_watch(payload)
+                inserted_events += int(bool(watch_result.get("inserted_watch")))
     except Exception as exc:
-        raise HTTPException(status_code=503, detail="failed to publish batch events") from exc
-    return {"status": "ok", "count": len(batch.events)}
+        raise HTTPException(status_code=503, detail="failed to persist batch events") from exc
+
+    return {
+        "status": "ok",
+        "count": len(batch.events),
+        "inserted_events": inserted_events,
+        "mode": "direct_db",
+    }
