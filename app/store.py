@@ -127,3 +127,44 @@ class FeatureStore:
                 cur.execute("SELECT item_id, score FROM item_popularity")
                 rows = cur.fetchall()
         return {row["item_id"]: row["score"] for row in rows}
+
+    def retrieve_candidates(self, user_id: str, limit: int = 200):
+        history = self.get_user_history(user_id)
+        seen = set(history)
+        scores = {}
+
+        # Use a few recent interactions with decay to stabilize near-real-time retrieval.
+        for depth, src_item in enumerate(reversed(history[-5:])):
+            decay = 1.0 / (depth + 1)
+            related = self.get_related_items(src_item)
+            for item_id, cnt in related.items():
+                if item_id in seen:
+                    continue
+                scores[item_id] = scores.get(item_id, 0.0) + (cnt * decay)
+
+        # Popularity fallback keeps recall robust for cold users / sparse history.
+        popularity = self.get_popularity_scores()
+        for item_id, score in popularity.items():
+            if item_id in seen:
+                continue
+            scores[item_id] = scores.get(item_id, 0.0) + (0.1 * score)
+
+        ranked = sorted(scores.items(), key=lambda pair: pair[1], reverse=True)
+        return [item_id for item_id, _ in ranked[:limit]]
+
+    def get_features_for_ranking(self, user_id: str, item_ids):
+        history = self.get_user_history(user_id)
+        history_set = set(history)
+        last_item = history[-1] if history else None
+
+        popularity = self.get_popularity_scores()
+        co_vis_last = self.get_related_items(last_item) if last_item else {}
+
+        features = {}
+        for item_id in item_ids:
+            features[item_id] = {
+                "seen_recent": 1.0 if item_id in history_set else 0.0,
+                "popularity_score": float(popularity.get(item_id, 0.0)),
+                "co_vis_last": float(co_vis_last.get(item_id, 0.0)),
+            }
+        return features

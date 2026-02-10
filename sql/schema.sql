@@ -39,3 +39,41 @@ CREATE TABLE IF NOT EXISTS co_visitation (
 );
 
 CREATE INDEX IF NOT EXISTS idx_co_prev_cnt ON co_visitation(prev_item_id, cnt DESC);
+
+-- Impression log for training-set joins and replay/debug
+CREATE TABLE IF NOT EXISTS impressions (
+  event_id      TEXT PRIMARY KEY,
+  user_id       TEXT NOT NULL,
+  session_id    TEXT NOT NULL,
+  request_id    TEXT NOT NULL,
+  ts_ms         BIGINT NOT NULL,
+  item_id       TEXT NOT NULL,
+  position      INT NOT NULL,
+  feed_id       TEXT,
+  slot          TEXT,
+  context       JSONB,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_impressions_user_ts ON impressions(user_id, ts_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_impressions_request ON impressions(request_id);
+
+-- Watch log for supervised labels and quality analytics
+CREATE TABLE IF NOT EXISTS watches (
+  event_id         TEXT PRIMARY KEY,
+  user_id          TEXT NOT NULL,
+  session_id       TEXT NOT NULL,
+  request_id       TEXT NOT NULL,
+  item_id          TEXT NOT NULL,
+  ts_ms            BIGINT NOT NULL,
+  watch_time_sec   DOUBLE PRECISION NOT NULL,
+  percent_watched  DOUBLE PRECISION,
+  ended            BOOLEAN,
+  playback_speed   DOUBLE PRECISION,
+  rebuffer_count   INT,
+  context          JSONB,
+  created_at       TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_watches_user_ts ON watches(user_id, ts_ms DESC);
+CREATE INDEX IF NOT EXISTS idx_watches_request ON watches(request_id);

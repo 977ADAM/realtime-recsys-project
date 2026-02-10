@@ -1,6 +1,3 @@
-import os
-import json
-import time
 import uuid
 import anyio
 from typing import Optional
@@ -14,50 +11,30 @@ from schemas import (
     RecoResponse,
     Context,
     EventBatch
-    )
-from aiokafka import AIOKafkaProducer
+)
 from store import FeatureStore
 from recommend import recommend
 from db import close_pool, init_db
+from kafka import KafkaPublisher, now_ms
 
 APP_NAME = "Real-time Recommender MVP + reco-logger"
-
-KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "localhost:9092")
-TOPIC_IMPRESSION = os.getenv("TOPIC_IMPRESSION", "reco_impression")
-TOPIC_WATCH = os.getenv("TOPIC_WATCH", "reco_watch")
 
 app = FastAPI(title=APP_NAME)
 
 store = FeatureStore()
-
-producer: Optional[AIOKafkaProducer] = None
+publisher = KafkaPublisher()
 
 
 @app.on_event("startup")
 async def startup():
     # Initialize DB schema (sync) without blocking the event loop
     await anyio.to_thread.run_sync(init_db)
-
-    global producer
-    producer = AIOKafkaProducer(
-        bootstrap_servers=KAFKA_BOOTSTRAP,
-        acks="all",
-        linger_ms=5,
-        retries=5,
-        compression_type="lz4",
-        request_timeout_ms=30000,
-        enable_idempotence=True,
-        max_in_flight_requests_per_connection=5,
-    )
-    await producer.start()
+    await publisher.start()
 
 @app.on_event("shutdown")
 async def shutdown():
     close_pool()
-    global producer
-    if producer is not None:
-        await producer.stop()
-        producer = None
+    await publisher.stop()
 
 
 @app.post("/event")
@@ -76,44 +53,42 @@ def get_recommend(user_id: str, k: int = 10):
     )
 
 
-def now_ms() -> int:
-    return int(time.time() * 1000)
-
-
 def new_request_id() -> str:
     # uuid4 is fine; you can switch to ULID if you prefer sortable ids
     return uuid.uuid4().hex
 
 
-async def kafka_send(topic: str, key: str, payload: dict) -> None:
-    global producer
-    if producer is None:
-        raise RuntimeError("Kafka producer is not initialized")
+def retrieve_candidates(user_id: str, k_retrieval: int = 200) -> list[str]:
+    return store.retrieve_candidates(user_id=user_id, limit=k_retrieval)
 
-    # Serialize to UTF-8 JSON bytes for Kafka
-    data = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    await producer.send_and_wait(topic, key=key.encode("utf-8"), value=data)
+
+def rank_candidates(user_id: str, candidates: list[str], k: int) -> list[str]:
+    if not candidates:
+        return []
+
+    features = store.get_features_for_ranking(user_id=user_id, item_ids=candidates)
+    ranked = sorted(
+        candidates,
+        key=lambda item: (
+            2.5 * features[item]["co_vis_last"]
+            + 1.0 * features[item]["popularity_score"]
+            - 5.0 * features[item]["seen_recent"]
+        ),
+        reverse=True,
+    )
+    return ranked[:k]
 
 @app.post("/log/impression")
 async def log_impression(evt: ImpressionEvent):
-    # Minimal validation
     if len(evt.items) == 0:
         raise HTTPException(status_code=400, detail="items must be non-empty")
-
-    payload = evt.model_dump()
-    # server receive timestamp to help debugging pipelines
-    payload["server_received_ts_ms"] = now_ms()
-
-    await kafka_send(TOPIC_IMPRESSION, key=evt.user_id, payload=payload)
+    await publisher.publish_impression(evt)
     return {"status": "ok"}
 
 
 @app.post("/log/watch")
 async def log_watch(evt: WatchEvent):
-    payload = evt.model_dump()
-    payload["server_received_ts_ms"] = now_ms()
-
-    await kafka_send(TOPIC_WATCH, key=evt.user_id, payload=payload)
+    await publisher.publish_watch(evt)
     return {"status": "ok"}
 
 
@@ -127,9 +102,8 @@ async def get_reco(
     user_agent: Optional[str] = Header(default=None, alias="User-Agent"),
 ):
     req_id = new_request_id()
-
-    # Dummy results
-    items = [f"item_{i}" for i in range(k)]
+    candidates = retrieve_candidates(user_id=user_id, k_retrieval=max(k * 20, 200))
+    items = rank_candidates(user_id=user_id, candidates=candidates, k=k)
 
     if x_autolog_impressions:
         imp_evt = ImpressionEvent(
@@ -140,11 +114,14 @@ async def get_reco(
             items=[ImpressionItem(item_id=item, position=pos) for pos, item in enumerate(items)],
             context=Context(user_agent=user_agent),
         )
-        payload = imp_evt.model_dump()
-        payload["server_received_ts_ms"] = now_ms()
-        await kafka_send(TOPIC_IMPRESSION, key=user_id, payload=payload)
+        await publisher.publish_impression(imp_evt)
 
-    return RecoResponse(request_id=req_id, items=items)
+    return RecoResponse(
+        request_id=req_id,
+        items=items,
+        model_version="rules-v1",
+        strategy="co_vis_popularity_hybrid",
+    )
 
 
 
@@ -152,12 +129,5 @@ async def get_reco(
 
 @app.post("/log/batch")
 async def log_batch(batch: EventBatch):
-    async with anyio.create_task_group() as tg:
-        for evt in batch.events:
-            payload = evt.model_dump()
-            payload["server_received_ts_ms"] = now_ms()
-
-            topic = TOPIC_IMPRESSION if evt.event_type == "impression" else TOPIC_WATCH
-            tg.start_soon(kafka_send, topic, evt.user_id, payload)
-
+    await publisher.publish_batch(batch.events)
     return {"status": "ok", "count": len(batch.events)}

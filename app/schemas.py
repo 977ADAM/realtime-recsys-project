@@ -1,3 +1,4 @@
+import uuid
 from pydantic import BaseModel, Field
 from typing import Literal, List, Dict, Optional, Union
 
@@ -36,34 +37,41 @@ class ImpressionItem(BaseModel):
     slot: Optional[str] = None              # e.g. "home_feed", "following_feed"
 
 
-class ImpressionEvent(BaseModel):
-    event_type: Literal["impression"] = "impression"
+class BaseLogEvent(BaseModel):
+    event_id: str = Field(default_factory=lambda: uuid.uuid4().hex)
     user_id: str
     session_id: str
     request_id: str
-    ts_ms: int                               # client or server timestamp in ms
-    items: List[ImpressionItem]
+    ts_ms: int
     context: Optional[Context] = None
 
 
-class WatchEvent(BaseModel):
+class ImpressionEvent(BaseLogEvent):
+    event_type: Literal["impression"] = "impression"
+    items: List[ImpressionItem]
+
+
+class WatchEvent(BaseLogEvent):
     event_type: Literal["watch"] = "watch"
-    user_id: str
-    session_id: str
-    request_id: str
     item_id: str
-    ts_ms: int
     watch_time_sec: float = Field(ge=0)
     percent_watched: Optional[float] = Field(default=None, ge=0, le=100)
     ended: Optional[bool] = None
     playback_speed: Optional[float] = Field(default=None, ge=0.25, le=4.0)
     rebuffer_count: Optional[int] = Field(default=None, ge=0)
-    context: Optional[Context] = None
 
 
 class RecoResponse(BaseModel):
     request_id: str
     items: List[str]
+    model_version: str = "rules-v1"
+    strategy: str = "co_vis_popularity_hybrid"
+
+
+class RecoRequest(BaseModel):
+    user_id: str
+    session_id: str
+    k: int = Field(default=20, ge=1, le=200)
 
 class EventBatch(BaseModel):
     events: List[Union[ImpressionEvent, WatchEvent]]
