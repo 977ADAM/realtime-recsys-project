@@ -22,7 +22,22 @@
 - Watches:
   - Stored as one row per event
   - Idempotent key: `event_id`
+  - Freshness loop: for newly inserted watches, feature tables are updated in the same transaction:
+    - `item_popularity`
+    - `co_visitation`
+    - `user_history`
 - `server_received_ts_ms` is persisted for both event types.
+
+## Online Feature Freshness Loop
+- Watch events are mapped to feature signal strength:
+  - strong watch (`percent_watched >= 80` or `watch_time_sec >= 120`) -> `purchase` signal, weight `10`
+  - medium watch (`percent_watched >= 40` or `watch_time_sec >= 30`) -> `click` signal, weight `3`
+  - otherwise -> `view` signal, weight `1`
+- Duplicate watch events (`event_id` conflict) do not update features.
+- Worker status (`GET /stream/worker`) includes:
+  - `feature_loop.watch_feature_updates`
+  - `feature_loop.watch_duplicates`
+  - `feature_loop.history_size`
 
 ## DLQ Envelope
 DLQ message contains:
@@ -43,9 +58,11 @@ DLQ message contains:
 - `KAFKA_WORKER_POLL_TIMEOUT_MS` (default `1000`)
 - `KAFKA_WORKER_MAX_POLL_RECORDS` (default `200`)
 - `TOPIC_DLQ` (default `reco_events_dlq`)
+- `STREAM_FEATURE_HISTORY_SIZE` (default `20`)
 
 ## Definition of Done (Week 3-4)
 - Worker processes impression/watch topics continuously.
 - Invalid events do not break pipeline and are routed to DLQ.
 - Event persistence is idempotent for at-least-once delivery.
 - Team can run backfill/replay with isolated consumer group.
+- Newly ingested watch events update online feature tables in near real time.

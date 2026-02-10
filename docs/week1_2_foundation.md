@@ -29,8 +29,27 @@
 - Duplicate events are accepted as request but ignored in feature updates (`status=duplicate`).
 - Contract settings are published via `GET /contract`.
 
+## Runtime Observability Baseline
+- `GET /metrics/reco` exposes rolling window metrics for serving path:
+  - sample size
+  - `p50/p95/p99` latency for `/reco`
+  - `2xx/4xx/5xx` counts and error rate
+  - SLA status against `reco_p95_ms` and `reco_p99_ms`
+- Runtime tuning:
+  - `RECO_METRICS_WINDOW_SEC` (default `3600`)
+  - `RECO_METRICS_MAX_SAMPLES` (default `50000`)
+
+## Baseline KPI Snapshot
+- `GET /analytics/baseline?days=7` computes initial product baseline from persisted logs:
+  - `ctr_at_20_pct` (watch-matched impressions / impressions)
+  - `avg_watch_time_sec`
+  - `catalog_coverage_at_20_pct`
+- Endpoint returns current KPI targets together with measured metrics for quick weekly review.
+
 ## Definition of Done (Week 1-2)
 - Contract is documented and versioned in repo.
 - API validates payload shape and time windows.
 - Ingestion is idempotent on `event_id` for core interaction events.
 - Team can inspect active KPI/SLA and event limits via API.
+- Team can inspect rolling serving metrics and compare with SLA targets.
+- Team can fetch baseline KPI snapshot directly from online logs.

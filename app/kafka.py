@@ -9,10 +9,16 @@ import anyio
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 
 if __package__:
-    from .db import persist_impression_event, persist_watch_event
+    from .db import (
+        persist_impression_event,
+        persist_watch_event_and_update_features,
+    )
     from .schemas import ImpressionEvent, WatchEvent
 else:  # pragma: no cover - fallback for direct script execution
-    from db import persist_impression_event, persist_watch_event
+    from db import (
+        persist_impression_event,
+        persist_watch_event_and_update_features,
+    )
     from schemas import ImpressionEvent, WatchEvent
 
 
@@ -133,6 +139,7 @@ class KafkaConsumerWorker:
         self.auto_offset_reset = auto_offset_reset or os.getenv("KAFKA_WORKER_AUTO_OFFSET_RESET", "latest")
         self.poll_timeout_ms = poll_timeout_ms or self._env_int("KAFKA_WORKER_POLL_TIMEOUT_MS", 1000)
         self.max_poll_records = max_poll_records or self._env_int("KAFKA_WORKER_MAX_POLL_RECORDS", 200)
+        self.feature_history_size = self._env_int("STREAM_FEATURE_HISTORY_SIZE", 20)
 
         if self.auto_offset_reset not in {"earliest", "latest"}:
             self.auto_offset_reset = "latest"
@@ -142,6 +149,8 @@ class KafkaConsumerWorker:
         self._task: Optional[asyncio.Task] = None
         self.processed_count = 0
         self.dlq_count = 0
+        self.watch_feature_updates = 0
+        self.watch_duplicates = 0
 
     @staticmethod
     def _env_bool(name: str, default: bool) -> bool:
@@ -178,6 +187,11 @@ class KafkaConsumerWorker:
             "auto_offset_reset": self.auto_offset_reset,
             "processed_count": self.processed_count,
             "dlq_count": self.dlq_count,
+            "feature_loop": {
+                "watch_feature_updates": self.watch_feature_updates,
+                "watch_duplicates": self.watch_duplicates,
+                "history_size": self.feature_history_size,
+            },
         }
 
     async def start(self) -> None:
@@ -288,7 +302,15 @@ class KafkaConsumerWorker:
 
             if message.topic == self.topic_watch:
                 event = WatchEvent.model_validate(payload)
-                await anyio.to_thread.run_sync(persist_watch_event, event)
+                result = await anyio.to_thread.run_sync(
+                    persist_watch_event_and_update_features,
+                    event,
+                    self.feature_history_size,
+                )
+                if result["inserted_watch"]:
+                    self.watch_feature_updates += 1
+                else:
+                    self.watch_duplicates += 1
                 return
 
             raise ValueError(f"Unsupported topic {message.topic}")

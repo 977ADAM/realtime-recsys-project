@@ -1,8 +1,9 @@
 import uuid
 import logging
+import time
 import anyio
 from typing import Optional
-from fastapi import FastAPI, Header, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query, Request
 
 if __package__:
     from .config import contract_snapshot
@@ -18,8 +19,9 @@ if __package__:
     )
     from .store import FeatureStore
     from .recommend import recommend
-    from .db import close_pool, init_db
+    from .db import close_pool, get_baseline_kpi_snapshot, init_db
     from .kafka import KafkaConsumerWorker, KafkaPublisher, now_ms
+    from .observability import RecoMetricsWindow
 else:  # pragma: no cover - fallback for direct script execution
     from config import contract_snapshot
     from schemas import (
@@ -34,8 +36,9 @@ else:  # pragma: no cover - fallback for direct script execution
     )
     from store import FeatureStore
     from recommend import recommend
-    from db import close_pool, init_db
+    from db import close_pool, get_baseline_kpi_snapshot, init_db
     from kafka import KafkaConsumerWorker, KafkaPublisher, now_ms
+    from observability import RecoMetricsWindow
 
 APP_NAME = "Real-time Recommender MVP + reco-logger"
 
@@ -45,6 +48,7 @@ logger = logging.getLogger(__name__)
 store = FeatureStore()
 publisher = KafkaPublisher()
 worker = KafkaConsumerWorker()
+reco_metrics = RecoMetricsWindow()
 
 
 @app.on_event("startup")
@@ -67,6 +71,25 @@ async def shutdown():
     close_pool()
 
 
+@app.middleware("http")
+async def collect_reco_metrics(request: Request, call_next):
+    if request.url.path != "/reco":
+        return await call_next(request)
+
+    started_at = time.perf_counter()
+    status_code = 500
+    try:
+        response = await call_next(request)
+        status_code = response.status_code
+        return response
+    except Exception:
+        status_code = 500
+        raise
+    finally:
+        latency_ms = (time.perf_counter() - started_at) * 1000.0
+        reco_metrics.record(latency_ms=latency_ms, status_code=status_code)
+
+
 @app.post("/event")
 def add_event(event: Event):
     applied = store.add_event(
@@ -87,6 +110,19 @@ def get_contract():
 @app.get("/stream/worker")
 def stream_worker_status():
     return worker.snapshot()
+
+
+@app.get("/metrics/reco")
+def reco_metrics_snapshot():
+    return reco_metrics.snapshot()
+
+
+@app.get("/analytics/baseline")
+def baseline_kpi_snapshot(days: int = Query(default=7, ge=1, le=30)):
+    return {
+        "kpi_targets": contract_snapshot()["kpi_targets"],
+        "metrics": get_baseline_kpi_snapshot(days=days),
+    }
 
 
 @app.get("/recommend", response_model=RecommendResponse)
