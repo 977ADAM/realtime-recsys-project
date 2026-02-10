@@ -73,5 +73,6 @@ class RecoRequest(BaseModel):
     session_id: str
     k: int = Field(default=20, ge=1, le=200)
 
+
 class EventBatch(BaseModel):
-    events: List[Union[ImpressionEvent, WatchEvent]]
+    events: List[Union[ImpressionEvent, WatchEvent]] = Field(min_length=1, max_length=1000)

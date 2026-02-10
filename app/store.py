@@ -118,7 +118,36 @@ class FeatureStore:
                 rows = cur.fetchall()
         return [row["item_id"] for row in rows]
 
-    def get_related_items(self, item_id: str):
+    def get_related_items(self, item_id: str, limit: Optional[int] = None):
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                if limit is None:
+                    cur.execute(
+                        """
+                        SELECT next_item_id, cnt
+                        FROM co_visitation
+                        WHERE prev_item_id = %s
+                        ORDER BY cnt DESC
+                        """,
+                        (item_id,),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        SELECT next_item_id, cnt
+                        FROM co_visitation
+                        WHERE prev_item_id = %s
+                        ORDER BY cnt DESC
+                        LIMIT %s
+                        """,
+                        (item_id, limit),
+                    )
+                rows = cur.fetchall()
+        return {row["next_item_id"]: row["cnt"] for row in rows}
+
+    def get_related_items_for_targets(self, item_id: str, target_item_ids):
+        if not target_item_ids:
+            return {}
         with get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -126,16 +155,44 @@ class FeatureStore:
                     SELECT next_item_id, cnt
                     FROM co_visitation
                     WHERE prev_item_id = %s
+                      AND next_item_id = ANY(%s)
                     """,
-                    (item_id,),
+                    (item_id, list(target_item_ids)),
                 )
                 rows = cur.fetchall()
         return {row["next_item_id"]: row["cnt"] for row in rows}
 
-    def get_popularity_scores(self):
+    def get_popularity_scores(self, limit: Optional[int] = None):
         with get_conn() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT item_id, score FROM item_popularity")
+                if limit is None:
+                    cur.execute("SELECT item_id, score FROM item_popularity ORDER BY score DESC")
+                else:
+                    cur.execute(
+                        """
+                        SELECT item_id, score
+                        FROM item_popularity
+                        ORDER BY score DESC
+                        LIMIT %s
+                        """,
+                        (limit,),
+                    )
+                rows = cur.fetchall()
+        return {row["item_id"]: row["score"] for row in rows}
+
+    def get_popularity_scores_for_items(self, item_ids):
+        if not item_ids:
+            return {}
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT item_id, score
+                    FROM item_popularity
+                    WHERE item_id = ANY(%s)
+                    """,
+                    (list(item_ids),),
+                )
                 rows = cur.fetchall()
         return {row["item_id"]: row["score"] for row in rows}
 
@@ -147,14 +204,14 @@ class FeatureStore:
         # Use a few recent interactions with decay to stabilize near-real-time retrieval.
         for depth, src_item in enumerate(reversed(history[-5:])):
             decay = 1.0 / (depth + 1)
-            related = self.get_related_items(src_item)
+            related = self.get_related_items(src_item, limit=200)
             for item_id, cnt in related.items():
                 if item_id in seen:
                     continue
                 scores[item_id] = scores.get(item_id, 0.0) + (cnt * decay)
 
         # Popularity fallback keeps recall robust for cold users / sparse history.
-        popularity = self.get_popularity_scores()
+        popularity = self.get_popularity_scores(limit=max(limit * 5, 500))
         for item_id, score in popularity.items():
             if item_id in seen:
                 continue
@@ -168,8 +225,12 @@ class FeatureStore:
         history_set = set(history)
         last_item = history[-1] if history else None
 
-        popularity = self.get_popularity_scores()
-        co_vis_last = self.get_related_items(last_item) if last_item else {}
+        popularity = self.get_popularity_scores_for_items(item_ids)
+        co_vis_last = (
+            self.get_related_items_for_targets(last_item, item_ids)
+            if last_item
+            else {}
+        )
 
         features = {}
         for item_id in item_ids:

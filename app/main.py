@@ -1,4 +1,5 @@
 import uuid
+import logging
 import anyio
 from typing import Optional
 from fastapi import FastAPI, Header, HTTPException, Query
@@ -37,6 +38,7 @@ else:  # pragma: no cover - fallback for direct script execution
 APP_NAME = "Real-time Recommender MVP + reco-logger"
 
 app = FastAPI(title=APP_NAME)
+logger = logging.getLogger(__name__)
 
 store = FeatureStore()
 publisher = KafkaPublisher()
@@ -46,7 +48,10 @@ publisher = KafkaPublisher()
 async def startup():
     # Initialize DB schema (sync) without blocking the event loop
     await anyio.to_thread.run_sync(init_db)
-    await publisher.start()
+    try:
+        await publisher.start()
+    except Exception:
+        logger.exception("Kafka is unavailable at startup; recommendation endpoints will stay online")
 
 @app.on_event("shutdown")
 async def shutdown():
@@ -99,13 +104,23 @@ def rank_candidates(user_id: str, candidates: list[str], k: int) -> list[str]:
 async def log_impression(evt: ImpressionEvent):
     if len(evt.items) == 0:
         raise HTTPException(status_code=400, detail="items must be non-empty")
-    await publisher.publish_impression(evt)
+    if not publisher.is_ready:
+        raise HTTPException(status_code=503, detail="kafka is unavailable")
+    try:
+        await publisher.publish_impression(evt)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="failed to publish impression event") from exc
     return {"status": "ok"}
 
 
 @app.post("/log/watch")
 async def log_watch(evt: WatchEvent):
-    await publisher.publish_watch(evt)
+    if not publisher.is_ready:
+        raise HTTPException(status_code=503, detail="kafka is unavailable")
+    try:
+        await publisher.publish_watch(evt)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="failed to publish watch event") from exc
     return {"status": "ok"}
 
 
@@ -134,7 +149,20 @@ async def get_reco(
             items=[ImpressionItem(item_id=item, position=pos) for pos, item in enumerate(items)],
             context=Context(user_agent=user_agent),
         )
-        await publisher.publish_impression(imp_evt)
+        if publisher.is_ready:
+            try:
+                await publisher.publish_impression(imp_evt)
+            except Exception:
+                logger.exception(
+                    "Failed to auto-log impressions for request_id=%s user_id=%s",
+                    req_id,
+                    user_id,
+                )
+        else:
+            logger.warning(
+                "Skipping auto-log impressions for request_id=%s because kafka is unavailable",
+                req_id,
+            )
 
     return RecoResponse(
         request_id=req_id,
@@ -145,5 +173,10 @@ async def get_reco(
 
 @app.post("/log/batch")
 async def log_batch(batch: EventBatch):
-    await publisher.publish_batch(batch.events)
+    if not publisher.is_ready:
+        raise HTTPException(status_code=503, detail="kafka is unavailable")
+    try:
+        await publisher.publish_batch(batch.events)
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="failed to publish batch events") from exc
     return {"status": "ok", "count": len(batch.events)}
