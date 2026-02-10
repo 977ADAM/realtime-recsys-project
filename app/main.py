@@ -1,21 +1,38 @@
 import uuid
 import anyio
 from typing import Optional
-from fastapi import FastAPI, Header, Request, HTTPException
-from schemas import (
-    Event,
-    RecommendResponse,
-    ImpressionEvent,
-    ImpressionItem,
-    WatchEvent,
-    RecoResponse,
-    Context,
-    EventBatch
-)
-from store import FeatureStore
-from recommend import recommend
-from db import close_pool, init_db
-from kafka import KafkaPublisher, now_ms
+from fastapi import FastAPI, Header, Request, HTTPException, Query
+
+try:
+    from .schemas import (
+        Event,
+        RecommendResponse,
+        ImpressionEvent,
+        ImpressionItem,
+        WatchEvent,
+        RecoResponse,
+        Context,
+        EventBatch,
+    )
+    from .store import FeatureStore
+    from .recommend import recommend
+    from .db import close_pool, init_db
+    from .kafka import KafkaPublisher, now_ms
+except ImportError:  # pragma: no cover - fallback for direct script execution
+    from schemas import (
+        Event,
+        RecommendResponse,
+        ImpressionEvent,
+        ImpressionItem,
+        WatchEvent,
+        RecoResponse,
+        Context,
+        EventBatch,
+    )
+    from store import FeatureStore
+    from recommend import recommend
+    from db import close_pool, init_db
+    from kafka import KafkaPublisher, now_ms
 
 APP_NAME = "Real-time Recommender MVP + reco-logger"
 
@@ -44,7 +61,7 @@ def add_event(event: Event):
 
 
 @app.get("/recommend", response_model=RecommendResponse)
-def get_recommend(user_id: str, k: int = 10):
+def get_recommend(user_id: str, k: int = Query(default=10, ge=1, le=200)):
     items = recommend(user_id, store, k)
     return RecommendResponse(
         user_id=user_id,
@@ -97,13 +114,17 @@ async def get_reco(
     request: Request,
     user_id: str,
     session_id: str,
-    k: int = 20,
+    k: int = Query(default=20, ge=1, le=200),
     x_autolog_impressions: bool = True,
     user_agent: Optional[str] = Header(default=None, alias="User-Agent"),
 ):
     req_id = new_request_id()
-    candidates = retrieve_candidates(user_id=user_id, k_retrieval=max(k * 20, 200))
-    items = rank_candidates(user_id=user_id, candidates=candidates, k=k)
+    candidates = await anyio.to_thread.run_sync(
+        retrieve_candidates,
+        user_id,
+        max(k * 20, 200),
+    )
+    items = await anyio.to_thread.run_sync(rank_candidates, user_id, candidates, k)
 
     if x_autolog_impressions:
         imp_evt = ImpressionEvent(
@@ -122,10 +143,6 @@ async def get_reco(
         model_version="rules-v1",
         strategy="co_vis_popularity_hybrid",
     )
-
-
-
-
 
 @app.post("/log/batch")
 async def log_batch(batch: EventBatch):

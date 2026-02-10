@@ -1,6 +1,9 @@
 from typing import Optional
 
-from db import get_conn, transaction
+try:
+    from .db import get_conn, transaction
+except ImportError:  # pragma: no cover - fallback for direct script execution
+    from db import get_conn, transaction
 
 
 WEIGHTS = {

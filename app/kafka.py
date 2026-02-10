@@ -6,7 +6,10 @@ from typing import Iterable, Optional, Union
 import anyio
 from aiokafka import AIOKafkaProducer
 
-from schemas import ImpressionEvent, WatchEvent
+try:
+    from .schemas import ImpressionEvent, WatchEvent
+except ImportError:  # pragma: no cover - fallback for direct script execution
+    from schemas import ImpressionEvent, WatchEvent
 
 
 def now_ms() -> int:

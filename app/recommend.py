@@ -9,6 +9,7 @@ def recommend(user_id: str, store, k: int = 10) -> List[str]:
 
     seen = set(history)
     candidates = []
+    added = set()
 
     # 70% co-visitation
     if history:
@@ -22,8 +23,9 @@ def recommend(user_id: str, store, k: int = 10) -> List[str]:
         ranked = sorted(related.items(), key=lambda x: -x[1])
 
         for item, _ in ranked:
-            if item not in seen:
+            if item not in seen and item not in added:
                 candidates.append(item)
+                added.add(item)
 
     # 30% popularity fallback
     if hasattr(store, "get_popularity_scores"):
@@ -33,7 +35,8 @@ def recommend(user_id: str, store, k: int = 10) -> List[str]:
 
     popular = sorted(popularity.items(), key=lambda x: -x[1])
     for item, _ in popular:
-        if item not in seen:
+        if item not in seen and item not in added:
             candidates.append(item)
+            added.add(item)
 
     return candidates[:k]
