@@ -17,7 +17,7 @@ try:
 except ImportError:
     ConnectionPool = None
 
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/recsys")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://adam:977977977@localhost:5432/recsys")
 SCHEMA_PATH = Path(__file__).resolve().parents[1] / "sql" / "schema.sql"
 
 _pool = None

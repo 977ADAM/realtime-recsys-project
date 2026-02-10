@@ -36,6 +36,15 @@ Backend service for online recommendation retrieval/ranking and event logging.
 - `POST /log/batch`
 - `GET /stream/worker`: streaming worker state and counters
 
+## Локальная платформа Kafka (без ручного экспорта)
+- Запустите локальный брокер, совместимый с Kafka.:
+  - `docker compose -f docker-compose.kafka.yml up -d`
+- Стоп-брокер:
+  - `docker compose -f docker-compose.kafka.yml down`
+- Настройки приложения по умолчанию уже соответствуют локальному брокеру.:
+  - `KAFKA_BOOTSTRAP=localhost:9092` (default in code)
+  - `KAFKA_COMPRESSION_TYPE=none` (default in code)
+
 ## Streaming Worker Enablement
 - Start dedicated worker process:
   - `python3 -m app.worker_main`

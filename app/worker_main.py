@@ -5,11 +5,11 @@ import signal
 from contextlib import suppress
 
 if __package__:
-    from .db import init_db
+    from .db import close_pool, init_db
     from .kafka import KafkaConsumerWorker
     from .prom_metrics import start_worker_metrics_http_server
 else:  # pragma: no cover - fallback for direct script execution
-    from db import init_db
+    from db import close_pool, init_db
     from kafka import KafkaConsumerWorker
     from prom_metrics import start_worker_metrics_http_server
 
@@ -32,19 +32,22 @@ async def _run_worker() -> None:
     start_worker_metrics_http_server()
 
     worker = KafkaConsumerWorker(enabled=True)
-    await worker.start()
+    try:
+        await worker.start()
 
-    stop_event = asyncio.Event()
-    loop = asyncio.get_running_loop()
+        stop_event = asyncio.Event()
+        loop = asyncio.get_running_loop()
 
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        with suppress(NotImplementedError):
-            loop.add_signal_handler(sig, stop_event.set)
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            with suppress(NotImplementedError):
+                loop.add_signal_handler(sig, stop_event.set)
 
-    logger.info("Kafka worker service is running")
-    await stop_event.wait()
-    logger.info("Stop signal received, shutting down Kafka worker service")
-    await worker.stop()
+        logger.info("Kafka worker service is running")
+        await stop_event.wait()
+        logger.info("Stop signal received, shutting down Kafka worker service")
+    finally:
+        await worker.stop()
+        await asyncio.to_thread(close_pool)
 
 
 def main() -> None:

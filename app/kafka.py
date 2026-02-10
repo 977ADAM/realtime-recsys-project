@@ -7,6 +7,7 @@ from typing import Iterable, Optional, Union
 
 import anyio
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
+from aiokafka.errors import KafkaConnectionError
 
 if __package__:
     from .db import (
@@ -69,6 +70,16 @@ class KafkaPublisher:
             return default
         return value if value > 0 else default
 
+    @staticmethod
+    def _env_compression_type(default: Optional[str] = None) -> Optional[str]:
+        raw = os.getenv("KAFKA_COMPRESSION_TYPE")
+        if raw is None:
+            return default
+        value = raw.strip().lower()
+        if not value or value in {"none", "null", "off", "false", "0"}:
+            return None
+        return value
+
     @property
     def is_ready(self) -> bool:
         return self._producer is not None
@@ -76,18 +87,61 @@ class KafkaPublisher:
     async def start(self) -> None:
         if self._producer is not None:
             return
-        producer = AIOKafkaProducer(
-            bootstrap_servers=self.bootstrap_servers,
-            acks="all",
-            linger_ms=5,
-            retries=5,
-            compression_type="lz4",
-            request_timeout_ms=30000,
-            enable_idempotence=True,
-            max_in_flight_requests_per_connection=5,
-        )
-        await producer.start()
-        self._producer = producer
+        compression_type = self._env_compression_type()
+        startup_retries = self._env_int("KAFKA_STARTUP_RETRIES", 20)
+        retry_delay_ms = self._env_int("KAFKA_STARTUP_RETRY_DELAY_MS", 500)
+
+        def _build_producer() -> AIOKafkaProducer:
+            producer_kwargs = {
+                "bootstrap_servers": self.bootstrap_servers,
+                "acks": "all",
+                "linger_ms": 5,
+                "request_timeout_ms": 30000,
+                "enable_idempotence": True,
+            }
+            if compression_type is not None:
+                producer_kwargs["compression_type"] = compression_type
+
+            try:
+                return AIOKafkaProducer(**producer_kwargs)
+            except RuntimeError as exc:
+                if compression_type is None or "Compression library for" not in str(exc):
+                    raise
+                logger.warning(
+                    "Kafka compression '%s' is unavailable, falling back to no compression",
+                    compression_type,
+                )
+                producer_kwargs.pop("compression_type", None)
+                return AIOKafkaProducer(**producer_kwargs)
+
+        for attempt in range(1, startup_retries + 1):
+            producer = _build_producer()
+            try:
+                await producer.start()
+                self._producer = producer
+                return
+            except KafkaConnectionError:
+                try:
+                    await producer.stop()
+                except Exception:
+                    logger.exception("Failed to close Kafka producer after bootstrap failure")
+
+                if attempt >= startup_retries:
+                    raise
+
+                logger.warning(
+                    "Kafka bootstrap failed (%s/%s); retrying in %sms",
+                    attempt,
+                    startup_retries,
+                    retry_delay_ms,
+                )
+                await anyio.sleep(retry_delay_ms / 1000)
+            except Exception:
+                try:
+                    await producer.stop()
+                except Exception:
+                    logger.exception("Failed to close Kafka producer after startup error")
+                raise
 
     async def stop(self) -> None:
         if self._producer is None:
@@ -221,36 +275,39 @@ class KafkaConsumerWorker:
         if self._task is not None:
             return
 
-        consumer = AIOKafkaConsumer(
-            self.topic_impression,
-            self.topic_watch,
-            bootstrap_servers=self.bootstrap_servers,
-            group_id=self.group_id,
-            enable_auto_commit=False,
-            auto_offset_reset=self.auto_offset_reset,
-            request_timeout_ms=30000,
-        )
-        dlq_producer = AIOKafkaProducer(
-            bootstrap_servers=self.bootstrap_servers,
-            acks="all",
-            retries=5,
-            linger_ms=5,
-            request_timeout_ms=30000,
-            enable_idempotence=True,
-        )
+        consumer: Optional[AIOKafkaConsumer] = None
+        dlq_producer: Optional[AIOKafkaProducer] = None
 
         try:
+            consumer = AIOKafkaConsumer(
+                self.topic_impression,
+                self.topic_watch,
+                bootstrap_servers=self.bootstrap_servers,
+                group_id=self.group_id,
+                enable_auto_commit=False,
+                auto_offset_reset=self.auto_offset_reset,
+                request_timeout_ms=30000,
+            )
+            dlq_producer = AIOKafkaProducer(
+                bootstrap_servers=self.bootstrap_servers,
+                acks="all",
+                linger_ms=5,
+                request_timeout_ms=30000,
+                enable_idempotence=True,
+            )
             await consumer.start()
             await dlq_producer.start()
         except Exception:
-            try:
-                await consumer.stop()
-            except Exception:
-                logger.exception("Failed to stop consumer after startup error")
-            try:
-                await dlq_producer.stop()
-            except Exception:
-                logger.exception("Failed to stop DLQ producer after startup error")
+            if consumer is not None:
+                try:
+                    await consumer.stop()
+                except Exception:
+                    logger.exception("Failed to stop consumer after startup error")
+            if dlq_producer is not None:
+                try:
+                    await dlq_producer.stop()
+                except Exception:
+                    logger.exception("Failed to stop DLQ producer after startup error")
             raise
 
         self._consumer = consumer
