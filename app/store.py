@@ -1,4 +1,5 @@
 from typing import Optional
+import uuid
 
 if __package__:
     from .db import get_conn, transaction
@@ -24,22 +25,35 @@ class FeatureStore:
     def __init__(self, history_size: int = 20):
         self.history_size = history_size
 
-    def add_event(self, user_id: str, item_id: str, event_type: str, ts: Optional[int] = None):
+    def add_event(
+        self,
+        user_id: str,
+        item_id: str,
+        event_type: str,
+        ts: Optional[int] = None,
+        event_id: Optional[str] = None,
+    ) -> bool:
+        event_id = event_id or uuid.uuid4().hex
         weight = WEIGHTS[event_type]
         ts_seconds = _normalize_unix_ts_seconds(ts)
 
         with transaction() as conn:
             with conn.cursor() as cur:
-                # Serialize writes per user to keep history position monotonic.
-                cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (user_id,))
-
                 cur.execute(
                     """
-                    INSERT INTO events (user_id, item_id, event_type, ts)
-                    VALUES (%s, %s, %s, COALESCE(to_timestamp(%s), now()))
+                    INSERT INTO events (event_id, user_id, item_id, event_type, ts)
+                    VALUES (%s, %s, %s, %s, COALESCE(to_timestamp(%s), now()))
+                    ON CONFLICT (event_id) DO NOTHING
+                    RETURNING id
                     """,
-                    (user_id, item_id, event_type, ts_seconds),
+                    (event_id, user_id, item_id, event_type, ts_seconds),
                 )
+                inserted = cur.fetchone() is not None
+                if not inserted:
+                    return False
+
+                # Serialize writes per user to keep history position monotonic.
+                cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (user_id,))
 
                 cur.execute(
                     """
@@ -102,6 +116,7 @@ class FeatureStore:
                     """,
                     (user_id, self.history_size, user_id),
                 )
+        return True
 
     def get_user_history(self, user_id: str):
         with get_conn() as conn:

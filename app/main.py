@@ -5,6 +5,7 @@ from typing import Optional
 from fastapi import FastAPI, Header, HTTPException, Query
 
 if __package__:
+    from .config import contract_snapshot
     from .schemas import (
         Event,
         RecommendResponse,
@@ -18,8 +19,9 @@ if __package__:
     from .store import FeatureStore
     from .recommend import recommend
     from .db import close_pool, init_db
-    from .kafka import KafkaPublisher, now_ms
+    from .kafka import KafkaConsumerWorker, KafkaPublisher, now_ms
 else:  # pragma: no cover - fallback for direct script execution
+    from config import contract_snapshot
     from schemas import (
         Event,
         RecommendResponse,
@@ -33,7 +35,7 @@ else:  # pragma: no cover - fallback for direct script execution
     from store import FeatureStore
     from recommend import recommend
     from db import close_pool, init_db
-    from kafka import KafkaPublisher, now_ms
+    from kafka import KafkaConsumerWorker, KafkaPublisher, now_ms
 
 APP_NAME = "Real-time Recommender MVP + reco-logger"
 
@@ -42,6 +44,7 @@ logger = logging.getLogger(__name__)
 
 store = FeatureStore()
 publisher = KafkaPublisher()
+worker = KafkaConsumerWorker()
 
 
 @app.on_event("startup")
@@ -52,17 +55,38 @@ async def startup():
         await publisher.start()
     except Exception:
         logger.exception("Kafka is unavailable at startup; recommendation endpoints will stay online")
+    try:
+        await worker.start()
+    except Exception:
+        logger.exception("Kafka consumer worker failed at startup; API will keep serving")
 
 @app.on_event("shutdown")
 async def shutdown():
-    close_pool()
+    await worker.stop()
     await publisher.stop()
+    close_pool()
 
 
 @app.post("/event")
 def add_event(event: Event):
-    store.add_event(event.user_id, event.item_id, event.event_type, event.ts)
-    return {"status": "ok"}
+    applied = store.add_event(
+        user_id=event.user_id,
+        item_id=event.item_id,
+        event_type=event.event_type,
+        ts=event.ts,
+        event_id=event.event_id,
+    )
+    return {"status": "ok" if applied else "duplicate", "event_id": event.event_id}
+
+
+@app.get("/contract")
+def get_contract():
+    return contract_snapshot()
+
+
+@app.get("/stream/worker")
+def stream_worker_status():
+    return worker.snapshot()
 
 
 @app.get("/recommend", response_model=RecommendResponse)
