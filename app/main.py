@@ -1,9 +1,10 @@
+import os
 import uuid
 import logging
 import time
 import anyio
 from typing import Optional
-from fastapi import FastAPI, Header, HTTPException, Query, Request
+from fastapi import FastAPI, Header, HTTPException, Query, Request, Response
 
 if __package__:
     from .config import contract_snapshot
@@ -19,9 +20,15 @@ if __package__:
     )
     from .store import FeatureStore
     from .recommend import recommend
+    from .ranking import rank_items_by_features
     from .db import close_pool, get_baseline_kpi_snapshot, init_db
     from .kafka import KafkaConsumerWorker, KafkaPublisher, now_ms
     from .observability import RecoMetricsWindow
+    from .prom_metrics import (
+        observe_reco_request,
+        prometheus_content_type,
+        prometheus_payload,
+    )
 else:  # pragma: no cover - fallback for direct script execution
     from config import contract_snapshot
     from schemas import (
@@ -36,18 +43,34 @@ else:  # pragma: no cover - fallback for direct script execution
     )
     from store import FeatureStore
     from recommend import recommend
+    from ranking import rank_items_by_features
     from db import close_pool, get_baseline_kpi_snapshot, init_db
     from kafka import KafkaConsumerWorker, KafkaPublisher, now_ms
     from observability import RecoMetricsWindow
+    from prom_metrics import (
+        observe_reco_request,
+        prometheus_content_type,
+        prometheus_payload,
+    )
 
 APP_NAME = "Real-time Recommender MVP + reco-logger"
 
 app = FastAPI(title=APP_NAME)
 logger = logging.getLogger(__name__)
 
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+API_EMBEDDED_WORKER_ENABLED = _env_bool("API_EMBEDDED_WORKER_ENABLED", False)
+
 store = FeatureStore()
 publisher = KafkaPublisher()
-worker = KafkaConsumerWorker()
+worker = KafkaConsumerWorker(enabled=API_EMBEDDED_WORKER_ENABLED)
 reco_metrics = RecoMetricsWindow()
 
 
@@ -59,14 +82,18 @@ async def startup():
         await publisher.start()
     except Exception:
         logger.exception("Kafka is unavailable at startup; recommendation endpoints will stay online")
-    try:
-        await worker.start()
-    except Exception:
-        logger.exception("Kafka consumer worker failed at startup; API will keep serving")
+    if API_EMBEDDED_WORKER_ENABLED:
+        try:
+            await worker.start()
+        except Exception:
+            logger.exception("Embedded Kafka consumer worker failed at startup; API will keep serving")
+    else:
+        logger.info("Embedded worker is disabled; run `python -m app.worker_main` as a separate service")
 
 @app.on_event("shutdown")
 async def shutdown():
-    await worker.stop()
+    if API_EMBEDDED_WORKER_ENABLED:
+        await worker.stop()
     await publisher.stop()
     close_pool()
 
@@ -88,6 +115,7 @@ async def collect_reco_metrics(request: Request, call_next):
     finally:
         latency_ms = (time.perf_counter() - started_at) * 1000.0
         reco_metrics.record(latency_ms=latency_ms, status_code=status_code)
+        observe_reco_request(latency_ms=latency_ms, status_code=status_code)
 
 
 @app.post("/event")
@@ -109,12 +137,24 @@ def get_contract():
 
 @app.get("/stream/worker")
 def stream_worker_status():
-    return worker.snapshot()
+    snapshot = worker.snapshot()
+    snapshot["mode"] = "embedded" if API_EMBEDDED_WORKER_ENABLED else "external"
+    if not API_EMBEDDED_WORKER_ENABLED:
+        snapshot["note"] = "Worker is expected to run as a separate process (`python -m app.worker_main`)."
+    return snapshot
 
 
 @app.get("/metrics/reco")
 def reco_metrics_snapshot():
     return reco_metrics.snapshot()
+
+
+@app.get("/metrics/prometheus")
+def prometheus_metrics():
+    payload = prometheus_payload()
+    if payload is None:
+        raise HTTPException(status_code=501, detail="prometheus_client is not installed")
+    return Response(content=payload, media_type=prometheus_content_type())
 
 
 @app.get("/analytics/baseline")
@@ -149,16 +189,7 @@ def rank_candidates(user_id: str, candidates: list[str], k: int) -> list[str]:
         return []
 
     features = store.get_features_for_ranking(user_id=user_id, item_ids=candidates)
-    ranked = sorted(
-        candidates,
-        key=lambda item: (
-            2.5 * features[item]["co_vis_last"]
-            + 1.0 * features[item]["popularity_score"]
-            - 5.0 * features[item]["seen_recent"]
-        ),
-        reverse=True,
-    )
-    return ranked[:k]
+    return rank_items_by_features(candidates=candidates, features=features, k=k)
 
 @app.post("/log/impression")
 async def log_impression(evt: ImpressionEvent):

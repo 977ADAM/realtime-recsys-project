@@ -1,0 +1,179 @@
+import logging
+import os
+from typing import Optional
+
+
+logger = logging.getLogger(__name__)
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+try:
+    from prometheus_client import (  # type: ignore
+        CONTENT_TYPE_LATEST,
+        Counter,
+        Gauge,
+        Histogram,
+        generate_latest,
+        start_http_server,
+    )
+
+    PROMETHEUS_AVAILABLE = True
+except ImportError:  # pragma: no cover - runtime fallback when dependency is optional
+    CONTENT_TYPE_LATEST = "text/plain; version=0.0.4; charset=utf-8"
+    PROMETHEUS_AVAILABLE = False
+
+    class _NoopMetric:
+        def __init__(self, *args, **kwargs):
+            _ = args
+            _ = kwargs
+
+        def labels(self, **_kwargs):
+            return self
+
+        def inc(self, _value: float = 1.0):
+            return None
+
+        def observe(self, _value: float):
+            return None
+
+        def set(self, _value: float):
+            return None
+
+    def generate_latest():
+        return b""
+
+    def start_http_server(port: int, addr: str = "0.0.0.0"):
+        _ = port
+        _ = addr
+        return None
+
+    Counter = Gauge = Histogram = _NoopMetric
+
+
+_LAG_BUCKETS_MS = (
+    10,
+    25,
+    50,
+    100,
+    250,
+    500,
+    1000,
+    2500,
+    5000,
+    10000,
+    30000,
+    60000,
+    120000,
+    300000,
+)
+
+
+RECO_REQUEST_TOTAL = Counter(
+    "reco_api_requests_total",
+    "Total /reco requests grouped by response status family.",
+    labelnames=("status_family",),
+)
+
+RECO_REQUEST_LATENCY_MS = Histogram(
+    "reco_api_latency_ms",
+    "Latency distribution for /reco API requests.",
+    buckets=_LAG_BUCKETS_MS,
+)
+
+WORKER_RUNNING = Gauge(
+    "reco_worker_running",
+    "Kafka worker process state (1 running, 0 stopped).",
+)
+
+WORKER_PROCESSED_TOTAL = Counter(
+    "reco_worker_processed_total",
+    "Total successfully processed Kafka events by topic.",
+    labelnames=("topic",),
+)
+
+WORKER_CONSUMER_LAG_MS = Histogram(
+    "reco_worker_consumer_lag_ms",
+    "Consumer lag in milliseconds measured as processing_time - message_timestamp.",
+    labelnames=("topic",),
+    buckets=_LAG_BUCKETS_MS,
+)
+
+WORKER_DLQ_TOTAL = Counter(
+    "reco_worker_dlq_total",
+    "Total events moved to DLQ by source topic and error type.",
+    labelnames=("topic", "error_type"),
+)
+
+WATCH_EVENT_TO_FEATURE_LATENCY_MS = Histogram(
+    "reco_watch_event_to_feature_latency_ms",
+    "Latency from client event timestamp to successful online feature update.",
+    buckets=_LAG_BUCKETS_MS,
+)
+
+
+def observe_reco_request(latency_ms: float, status_code: int) -> None:
+    status_family = f"{max(status_code, 0) // 100}xx"
+    RECO_REQUEST_TOTAL.labels(status_family=status_family).inc()
+    RECO_REQUEST_LATENCY_MS.observe(max(float(latency_ms), 0.0))
+
+
+def set_worker_running(is_running: bool) -> None:
+    WORKER_RUNNING.set(1.0 if is_running else 0.0)
+
+
+def observe_worker_processed(topic: str, lag_ms: Optional[float]) -> None:
+    WORKER_PROCESSED_TOTAL.labels(topic=topic).inc()
+    if lag_ms is not None:
+        WORKER_CONSUMER_LAG_MS.labels(topic=topic).observe(max(float(lag_ms), 0.0))
+
+
+def observe_worker_dlq(topic: str, error_type: str) -> None:
+    error_label = error_type or "unknown"
+    WORKER_DLQ_TOTAL.labels(topic=topic, error_type=error_label).inc()
+
+
+def observe_watch_event_to_feature_latency(latency_ms: float) -> None:
+    WATCH_EVENT_TO_FEATURE_LATENCY_MS.observe(max(float(latency_ms), 0.0))
+
+
+def prometheus_payload() -> Optional[bytes]:
+    if not PROMETHEUS_AVAILABLE:
+        return None
+    return generate_latest()
+
+
+def prometheus_content_type() -> str:
+    return CONTENT_TYPE_LATEST
+
+
+def start_worker_metrics_http_server() -> bool:
+    if not _env_bool("PROMETHEUS_METRICS_ENABLED", True):
+        logger.info("Prometheus metrics server is disabled by config")
+        return False
+
+    if not PROMETHEUS_AVAILABLE:
+        logger.warning("prometheus_client is not installed; metrics server is disabled")
+        return False
+
+    host = os.getenv("WORKER_METRICS_HOST", "0.0.0.0")
+    port = _positive_int_env("WORKER_METRICS_PORT", 9108)
+    start_http_server(port=port, addr=host)
+    logger.info("Worker metrics server started at http://%s:%s/metrics", host, port)
+    return True

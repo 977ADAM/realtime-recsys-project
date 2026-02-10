@@ -6,6 +6,7 @@
 - Support replay/backfill mode through consumer configuration.
 
 ## Implemented Components
+- Historical note: API-integrated worker startup/shutdown described below was the Week 3-4 baseline and is superseded by external worker mode in `docs/week5_6_stage1_stabilization.md`.
 - `KafkaConsumerWorker` in `app/kafka.py`:
   - Consumes `TOPIC_IMPRESSION` and `TOPIC_WATCH`
   - Validates payloads via Pydantic schemas

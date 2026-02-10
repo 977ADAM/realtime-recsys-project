@@ -13,11 +13,23 @@ if __package__:
         persist_impression_event,
         persist_watch_event_and_update_features,
     )
+    from .prom_metrics import (
+        observe_watch_event_to_feature_latency,
+        observe_worker_dlq,
+        observe_worker_processed,
+        set_worker_running,
+    )
     from .schemas import ImpressionEvent, WatchEvent
 else:  # pragma: no cover - fallback for direct script execution
     from db import (
         persist_impression_event,
         persist_watch_event_and_update_features,
+    )
+    from prom_metrics import (
+        observe_watch_event_to_feature_latency,
+        observe_worker_dlq,
+        observe_worker_processed,
+        set_worker_running,
     )
     from schemas import ImpressionEvent, WatchEvent
 
@@ -151,6 +163,9 @@ class KafkaConsumerWorker:
         self.dlq_count = 0
         self.watch_feature_updates = 0
         self.watch_duplicates = 0
+        self.last_consumer_lag_ms: Optional[float] = None
+        self.last_event_to_feature_latency_ms: Optional[float] = None
+        self.last_processed_at_ms: Optional[int] = None
 
     @staticmethod
     def _env_bool(name: str, default: bool) -> bool:
@@ -187,6 +202,11 @@ class KafkaConsumerWorker:
             "auto_offset_reset": self.auto_offset_reset,
             "processed_count": self.processed_count,
             "dlq_count": self.dlq_count,
+            "runtime": {
+                "last_consumer_lag_ms": self.last_consumer_lag_ms,
+                "last_event_to_feature_latency_ms": self.last_event_to_feature_latency_ms,
+                "last_processed_at_ms": self.last_processed_at_ms,
+            },
             "feature_loop": {
                 "watch_feature_updates": self.watch_feature_updates,
                 "watch_duplicates": self.watch_duplicates,
@@ -236,6 +256,7 @@ class KafkaConsumerWorker:
         self._consumer = consumer
         self._dlq_producer = dlq_producer
         self._task = asyncio.create_task(self._run_loop(), name="kafka-consumer-worker")
+        set_worker_running(True)
         logger.info(
             "KafkaConsumerWorker started (group_id=%s, auto_offset_reset=%s)",
             self.group_id,
@@ -260,6 +281,8 @@ class KafkaConsumerWorker:
         if self._dlq_producer is not None:
             await self._dlq_producer.stop()
             self._dlq_producer = None
+
+        set_worker_running(False)
 
     async def _run_loop(self) -> None:
         if self._consumer is None:
@@ -292,12 +315,18 @@ class KafkaConsumerWorker:
                 await anyio.sleep(1)
 
     async def _process_message(self, message) -> None:
+        consumer_lag_ms = self._message_lag_ms(message)
+        if consumer_lag_ms is not None:
+            self.last_consumer_lag_ms = round(consumer_lag_ms, 3)
+
         raw_payload = self._message_to_text(message.value)
         try:
             payload = json.loads(raw_payload)
             if message.topic == self.topic_impression:
                 event = ImpressionEvent.model_validate(payload)
                 await anyio.to_thread.run_sync(persist_impression_event, event)
+                observe_worker_processed(topic=message.topic, lag_ms=consumer_lag_ms)
+                self.last_processed_at_ms = now_ms()
                 return
 
             if message.topic == self.topic_watch:
@@ -309,8 +338,13 @@ class KafkaConsumerWorker:
                 )
                 if result["inserted_watch"]:
                     self.watch_feature_updates += 1
+                    event_to_feature_latency_ms = max(float(now_ms() - event.ts_ms), 0.0)
+                    self.last_event_to_feature_latency_ms = round(event_to_feature_latency_ms, 3)
+                    observe_watch_event_to_feature_latency(event_to_feature_latency_ms)
                 else:
                     self.watch_duplicates += 1
+                observe_worker_processed(topic=message.topic, lag_ms=consumer_lag_ms)
+                self.last_processed_at_ms = now_ms()
                 return
 
             raise ValueError(f"Unsupported topic {message.topic}")
@@ -345,6 +379,7 @@ class KafkaConsumerWorker:
             value=data,
         )
         self.dlq_count += 1
+        observe_worker_dlq(topic=message.topic, error_type=type(error).__name__)
 
     @staticmethod
     def _message_to_text(value) -> str:
@@ -353,3 +388,10 @@ class KafkaConsumerWorker:
         if isinstance(value, bytes):
             return value.decode("utf-8", errors="replace")
         return str(value)
+
+    @staticmethod
+    def _message_lag_ms(message) -> Optional[float]:
+        timestamp = getattr(message, "timestamp", None)
+        if timestamp is None or timestamp <= 0:
+            return None
+        return max(float(now_ms() - timestamp), 0.0)
