@@ -1,9 +1,9 @@
 import uuid
 import anyio
 from typing import Optional
-from fastapi import FastAPI, Header, Request, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query
 
-try:
+if __package__:
     from .schemas import (
         Event,
         RecommendResponse,
@@ -18,7 +18,7 @@ try:
     from .recommend import recommend
     from .db import close_pool, init_db
     from .kafka import KafkaPublisher, now_ms
-except ImportError:  # pragma: no cover - fallback for direct script execution
+else:  # pragma: no cover - fallback for direct script execution
     from schemas import (
         Event,
         RecommendResponse,
@@ -111,7 +111,6 @@ async def log_watch(evt: WatchEvent):
 
 @app.get("/reco", response_model=RecoResponse)
 async def get_reco(
-    request: Request,
     user_id: str,
     session_id: str,
     k: int = Query(default=20, ge=1, le=200),

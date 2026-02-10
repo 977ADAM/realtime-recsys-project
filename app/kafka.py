@@ -6,9 +6,9 @@ from typing import Iterable, Optional, Union
 import anyio
 from aiokafka import AIOKafkaProducer
 
-try:
+if __package__:
     from .schemas import ImpressionEvent, WatchEvent
-except ImportError:  # pragma: no cover - fallback for direct script execution
+else:  # pragma: no cover - fallback for direct script execution
     from schemas import ImpressionEvent, WatchEvent
 
 

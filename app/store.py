@@ -1,8 +1,8 @@
 from typing import Optional
 
-try:
+if __package__:
     from .db import get_conn, transaction
-except ImportError:  # pragma: no cover - fallback for direct script execution
+else:  # pragma: no cover - fallback for direct script execution
     from db import get_conn, transaction
 
 
@@ -13,12 +13,20 @@ WEIGHTS = {
 }
 
 
+def _normalize_unix_ts_seconds(ts: Optional[int]) -> Optional[float]:
+    if ts is None:
+        return None
+    # Accept both seconds and milliseconds Unix timestamps.
+    return ts / 1000.0 if ts >= 10**12 else float(ts)
+
+
 class FeatureStore:
     def __init__(self, history_size: int = 20):
         self.history_size = history_size
 
     def add_event(self, user_id: str, item_id: str, event_type: str, ts: Optional[int] = None):
         weight = WEIGHTS[event_type]
+        ts_seconds = _normalize_unix_ts_seconds(ts)
 
         with transaction() as conn:
             with conn.cursor() as cur:
@@ -30,7 +38,7 @@ class FeatureStore:
                     INSERT INTO events (user_id, item_id, event_type, ts)
                     VALUES (%s, %s, %s, COALESCE(to_timestamp(%s), now()))
                     """,
-                    (user_id, item_id, event_type, ts),
+                    (user_id, item_id, event_type, ts_seconds),
                 )
 
                 cur.execute(
@@ -79,7 +87,7 @@ class FeatureStore:
                     SELECT %s, pos, %s, COALESCE(to_timestamp(%s), now())
                     FROM next_pos
                     """,
-                    (user_id, user_id, item_id, ts),
+                    (user_id, user_id, item_id, ts_seconds),
                 )
 
                 cur.execute(
