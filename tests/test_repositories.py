@@ -76,6 +76,31 @@ class RepositoryTests(unittest.TestCase):
         self.assertEqual(related, {"item-2": 7})
         self.assertIn("LIMIT %s", cur.executed[0][0])
 
+    def test_feature_repo_related_items_for_sources_is_grouped(self):
+        repo = FeatureRepository()
+        cur = _FakeCursor(
+            fetchall_results=[[
+                {"prev_item_id": "item-1", "next_item_id": "item-2", "cnt": 7},
+                {"prev_item_id": "item-1", "next_item_id": "item-3", "cnt": 3},
+                {"prev_item_id": "item-9", "next_item_id": "item-5", "cnt": 11},
+            ]]
+        )
+
+        related = repo.get_related_items_for_sources(
+            cur,
+            source_item_ids=["item-1", "item-9"],
+            limit_per_source=5,
+        )
+
+        self.assertEqual(
+            related,
+            {
+                "item-1": {"item-2": 7, "item-3": 3},
+                "item-9": {"item-5": 11},
+            },
+        )
+        self.assertIn("ROW_NUMBER()", cur.executed[0][0])
+
     def test_event_log_repo_counts_inserted_impression_rows(self):
         repo = EventLogRepository()
         cur = _FakeCursor(fetchone_results=[{"ok": 1}, None])

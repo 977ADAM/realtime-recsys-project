@@ -21,7 +21,6 @@ try:
 except ImportError:
     ConnectionPool = None
 
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://adam:977977977@localhost:5432/recsys")
 SCHEMA_PATH = Path(__file__).resolve().parents[1] / "sql" / "schema.sql"
 
 _pool = None
@@ -32,6 +31,13 @@ feature_repository = FeatureRepository()
 event_log_repository = EventLogRepository()
 
 
+def _database_url() -> str:
+    value = os.getenv("DATABASE_URL", "").strip()
+    if value:
+        return value
+    raise RuntimeError("DATABASE_URL is not configured")
+
+
 def _get_pool():
     global _pool
     if ConnectionPool is None:
@@ -40,7 +46,7 @@ def _get_pool():
         min_size = int(os.getenv("DB_POOL_MIN_SIZE", "1"))
         max_size = int(os.getenv("DB_POOL_MAX_SIZE", "10"))
         _pool = ConnectionPool(
-            conninfo=DATABASE_URL,
+            conninfo=_database_url(),
             min_size=min_size,
             max_size=max_size,
             kwargs={"row_factory": dict_row},
@@ -57,7 +63,7 @@ def get_conn():
             yield conn
         return
 
-    conn = psycopg.connect(DATABASE_URL, row_factory=dict_row)
+    conn = psycopg.connect(_database_url(), row_factory=dict_row)
     try:
         yield conn
     finally:
@@ -87,6 +93,17 @@ def close_pool():
     if _pool is not None:
         _pool.close()
         _pool = None
+
+
+def ping_db() -> bool:
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 AS ok")
+                row = cur.fetchone()
+    except Exception:
+        return False
+    return bool(row and int(row.get("ok", 0)) == 1)
 
 
 def _context_to_jsonb(context: Any):

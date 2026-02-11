@@ -121,6 +121,10 @@ def start_metrics_http_server() -> bool:
 
     host = os.getenv("METRICS_HOST", "0.0.0.0")
     port = positive_int_env("METRICS_PORT", 9108)
-    start_http_server(port=port, addr=host)
+    try:
+        start_http_server(port=port, addr=host)
+    except Exception as exc:
+        logger.warning("Failed to start metrics server (%s: %s)", exc.__class__.__name__, exc)
+        return False
     logger.info("Metrics server started at http://%s:%s/metrics", host, port)
     return True

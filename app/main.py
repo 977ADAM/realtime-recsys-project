@@ -12,14 +12,18 @@ if __package__:
         close_pool,
         get_baseline_kpi_snapshot,
         init_db,
+        ping_db,
         persist_impression_event,
         persist_watch_event_and_update_features,
     )
+    from .event_bus import KafkaEventBus
     from .observability import RecoMetricsWindow
     from .prom_metrics import (
+        observe_watch_event_to_feature_latency,
         observe_reco_request,
         prometheus_content_type,
         prometheus_payload,
+        start_metrics_http_server,
     )
     from .runtime_utils import env_bool, now_ms
     from .ranking import rank_items_by_features
@@ -41,14 +45,18 @@ else:  # pragma: no cover - fallback for direct script execution
         close_pool,
         get_baseline_kpi_snapshot,
         init_db,
+        ping_db,
         persist_impression_event,
         persist_watch_event_and_update_features,
     )
+    from event_bus import KafkaEventBus
     from observability import RecoMetricsWindow
     from prom_metrics import (
+        observe_watch_event_to_feature_latency,
         observe_reco_request,
         prometheus_content_type,
         prometheus_payload,
+        start_metrics_http_server,
     )
     from runtime_utils import env_bool, now_ms
     from ranking import rank_items_by_features
@@ -75,26 +83,33 @@ DB_INIT_ON_STARTUP = env_bool("DB_INIT_ON_STARTUP", True)
 
 store = FeatureStore()
 reco_metrics = RecoMetricsWindow()
+event_bus = KafkaEventBus()
 
 
 @app.on_event("startup")
 async def startup():
+    start_metrics_http_server()
+
     if not DB_INIT_ON_STARTUP:
         logger.info("DB init on startup is disabled; set DB_INIT_ON_STARTUP=true to auto-apply schema")
-        return
+    else:
+        try:
+            await anyio.to_thread.run_sync(init_db)
+        except Exception as exc:
+            logger.warning(
+                "Postgres is unavailable at startup; DB-backed endpoints may fail until DB is restored (%s: %s)",
+                exc.__class__.__name__,
+                exc,
+            )
 
-    try:
-        await anyio.to_thread.run_sync(init_db)
-    except Exception as exc:
-        logger.warning(
-            "Postgres is unavailable at startup; DB-backed endpoints may fail until DB is restored (%s: %s)",
-            exc.__class__.__name__,
-            exc,
-        )
+    await event_bus.start()
+    await anyio.to_thread.run_sync(store.start_cache)
 
 
 @app.on_event("shutdown")
 async def shutdown():
+    await event_bus.stop()
+    await anyio.to_thread.run_sync(store.stop_cache)
     close_pool()
 
 
@@ -146,6 +161,42 @@ def prometheus_metrics():
     if payload is None:
         raise HTTPException(status_code=501, detail="prometheus_client is not installed")
     return Response(content=payload, media_type=prometheus_content_type())
+
+
+@app.get("/healthz")
+def healthcheck():
+    return {
+        "status": "ok",
+        "event_bus": event_bus.snapshot(),
+        "online_cache": store.cache_snapshot(),
+    }
+
+
+@app.get("/readyz")
+async def readiness_check():
+    db_ready = ping_db()
+    if event_bus.enabled and not event_bus.is_ready:
+        await event_bus.start()
+    if not store.cache_ready():
+        await anyio.to_thread.run_sync(store.start_cache)
+    kafka_ready = (not event_bus.enabled) or event_bus.is_ready
+    cache_ready = store.cache_ready()
+    ready = db_ready and kafka_ready and cache_ready
+
+    payload = {
+        "ready": ready,
+        "checks": {
+            "db": db_ready,
+            "event_bus": kafka_ready,
+            "online_cache": cache_ready,
+        },
+        "event_bus": event_bus.snapshot(),
+        "online_cache": store.cache_snapshot(),
+    }
+
+    if not ready:
+        raise HTTPException(status_code=503, detail=payload)
+    return payload
 
 
 @app.get("/analytics/baseline")
@@ -202,10 +253,15 @@ async def log_impression(evt: ImpressionEvent):
     except Exception as exc:
         raise HTTPException(status_code=503, detail="failed to persist impression event") from exc
 
+    kafka_published = False
+    if inserted_rows > 0:
+        kafka_published = await event_bus.publish_impression(payload)
+
     return {
         "status": "ok" if inserted_rows > 0 else "duplicate",
         "inserted_rows": inserted_rows,
-        "mode": "direct_db",
+        "mode": event_bus.mode,
+        "event_bus_published": kafka_published,
     }
 
 
@@ -217,10 +273,22 @@ async def log_watch(evt: WatchEvent):
     except Exception as exc:
         raise HTTPException(status_code=503, detail="failed to persist watch event") from exc
 
+    inserted_watch = bool(persist_result.get("inserted_watch"))
+    feature_updated = bool(persist_result.get("feature_updated"))
+    if inserted_watch and feature_updated:
+        observe_watch_event_to_feature_latency(max(now_ms() - payload.ts_ms, 0.0))
+        await anyio.to_thread.run_sync(store.invalidate_user_history_cache, payload.user_id)
+        await anyio.to_thread.run_sync(store.invalidate_popularity_cache)
+
+    kafka_published = False
+    if inserted_watch:
+        kafka_published = await event_bus.publish_watch(payload)
+
     return {
-        "status": "ok" if persist_result.get("inserted_watch") else "duplicate",
-        "feature_updated": bool(persist_result.get("feature_updated")),
-        "mode": "direct_db",
+        "status": "ok" if inserted_watch else "duplicate",
+        "feature_updated": feature_updated,
+        "mode": event_bus.mode,
+        "event_bus_published": kafka_published,
     }
 
 
@@ -251,7 +319,15 @@ async def get_reco(
         )
         payload = _with_server_received_ts(imp_evt)
         try:
-            await _persist_impression(payload)
+            inserted_rows = await _persist_impression(payload)
+            if inserted_rows > 0:
+                kafka_published = await event_bus.publish_impression(payload)
+                if event_bus.enabled and not kafka_published:
+                    logger.warning(
+                        "DB insert succeeded but Kafka publish failed for auto impression request_id=%s user_id=%s",
+                        req_id,
+                        user_id,
+                    )
         except Exception:
             logger.exception(
                 "Failed to auto-log impressions for request_id=%s user_id=%s",
@@ -275,20 +351,41 @@ async def get_reco(
 @app.post("/log/batch")
 async def log_batch(batch: EventBatch):
     inserted_events = 0
+    event_bus_published = 0
+    users_with_feature_updates = set()
+    has_popularity_updates = False
     try:
         for event in batch.events:
             payload = _with_server_received_ts(event)
             if event.event_type == "impression":
-                inserted_events += int(await _persist_impression(payload) > 0)
+                inserted_impression = await _persist_impression(payload)
+                inserted_events += int(inserted_impression > 0)
+                if inserted_impression > 0:
+                    event_bus_published += int(await event_bus.publish_impression(payload))
             else:
                 watch_result = await _persist_watch(payload)
-                inserted_events += int(bool(watch_result.get("inserted_watch")))
+                inserted_watch = bool(watch_result.get("inserted_watch"))
+                feature_updated = bool(watch_result.get("feature_updated"))
+                inserted_events += int(inserted_watch)
+                if inserted_watch and feature_updated:
+                    observe_watch_event_to_feature_latency(max(now_ms() - payload.ts_ms, 0.0))
+                    users_with_feature_updates.add(payload.user_id)
+                    has_popularity_updates = True
+                if inserted_watch:
+                    event_bus_published += int(await event_bus.publish_watch(payload))
     except Exception as exc:
         raise HTTPException(status_code=503, detail="failed to persist batch events") from exc
+
+    if users_with_feature_updates:
+        for user_id in users_with_feature_updates:
+            await anyio.to_thread.run_sync(store.invalidate_user_history_cache, user_id)
+    if has_popularity_updates:
+        await anyio.to_thread.run_sync(store.invalidate_popularity_cache)
 
     return {
         "status": "ok",
         "count": len(batch.events),
         "inserted_events": inserted_events,
-        "mode": "direct_db",
+        "mode": event_bus.mode,
+        "event_bus_published": event_bus_published,
     }

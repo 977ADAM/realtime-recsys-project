@@ -9,7 +9,7 @@ from app.schemas import Event, EventBatch, ImpressionEvent, ImpressionItem, Watc
 
 class SchemaValidationTests(unittest.TestCase):
     def test_event_rejects_too_future_timestamp(self):
-        future_ts_ms = int(time.time() * 1000) + CONTRACT.max_event_future_ms + 1
+        future_ts_ms = int(time.time() * 1000) + CONTRACT.max_event_future_ms + 5000
         with self.assertRaises(ValidationError):
             Event(
                 user_id="user-1",

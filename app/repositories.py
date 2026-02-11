@@ -79,6 +79,21 @@ class FeatureRepository:
           AND next_item_id = ANY(%s)
     """
 
+    _SELECT_RELATED_ITEMS_FOR_SOURCES_SQL = """
+        WITH ranked AS (
+            SELECT
+                prev_item_id,
+                next_item_id,
+                cnt,
+                ROW_NUMBER() OVER (PARTITION BY prev_item_id ORDER BY cnt DESC) AS rn
+            FROM co_visitation
+            WHERE prev_item_id = ANY(%s)
+        )
+        SELECT prev_item_id, next_item_id, cnt
+        FROM ranked
+        WHERE rn <= %s
+    """
+
     _SELECT_POPULARITY_SCORES_SQL = "SELECT item_id, score FROM item_popularity ORDER BY score DESC"
     _SELECT_POPULARITY_SCORES_WITH_LIMIT_SQL = _SELECT_POPULARITY_SCORES_SQL + "\nLIMIT %s"
 
@@ -164,6 +179,26 @@ class FeatureRepository:
         cur.execute(self._SELECT_RELATED_ITEMS_FOR_TARGETS_SQL, (item_id, target_ids))
         rows = cur.fetchall()
         return {row["next_item_id"]: row["cnt"] for row in rows}
+
+    def get_related_items_for_sources(
+        self,
+        cur,
+        source_item_ids: Iterable[str],
+        limit_per_source: int,
+    ) -> dict:
+        source_ids = list(dict.fromkeys(source_item_ids))
+        if not source_ids:
+            return {}
+
+        cur.execute(
+            self._SELECT_RELATED_ITEMS_FOR_SOURCES_SQL,
+            (source_ids, max(int(limit_per_source), 1)),
+        )
+        rows = cur.fetchall()
+        result = {source_id: {} for source_id in source_ids}
+        for row in rows:
+            result.setdefault(row["prev_item_id"], {})[row["next_item_id"]] = row["cnt"]
+        return result
 
     def get_popularity_scores(self, cur, limit: Optional[int]) -> dict:
         if limit is None:
