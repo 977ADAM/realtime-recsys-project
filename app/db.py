@@ -8,9 +8,11 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 if __package__:
+    from .repositories import EventLogRepository, FeatureRepository
     from .runtime_utils import normalize_unix_ts_seconds, positive_int_env
     from .schemas import ImpressionEvent, WatchEvent
 else:  # pragma: no cover - fallback for direct script execution
+    from repositories import EventLogRepository, FeatureRepository
     from runtime_utils import normalize_unix_ts_seconds, positive_int_env
     from schemas import ImpressionEvent, WatchEvent
 
@@ -26,6 +28,8 @@ _pool = None
 
 
 STREAM_FEATURE_HISTORY_SIZE = positive_int_env("STREAM_FEATURE_HISTORY_SIZE", 20)
+feature_repository = FeatureRepository()
+event_log_repository = EventLogRepository()
 
 
 def _get_pool():
@@ -100,105 +104,18 @@ def _watch_signal_to_event(event: WatchEvent) -> Tuple[str, int]:
     return "view", 1
 
 
-_WATCH_INSERT_SQL = """
-    INSERT INTO watches (
-        event_id,
-        user_id,
-        session_id,
-        request_id,
-        item_id,
-        ts_ms,
-        server_received_ts_ms,
-        watch_time_sec,
-        percent_watched,
-        ended,
-        playback_speed,
-        rebuffer_count,
-        context
-    )
-    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-    ON CONFLICT (event_id) DO NOTHING
-    RETURNING 1
-"""
-
-
-def _watch_insert_params(event: WatchEvent, context_jsonb: Any) -> tuple:
-    return (
-        event.event_id,
-        event.user_id,
-        event.session_id,
-        event.request_id,
-        event.item_id,
-        event.ts_ms,
-        getattr(event, "server_received_ts_ms", None),
-        event.watch_time_sec,
-        event.percent_watched,
-        event.ended,
-        event.playback_speed,
-        event.rebuffer_count,
-        context_jsonb,
-    )
-
-
-def _insert_watch_event(cur, event: WatchEvent, context_jsonb: Any) -> bool:
-    cur.execute(_WATCH_INSERT_SQL, _watch_insert_params(event, context_jsonb))
-    return cur.fetchone() is not None
-
-
 def persist_impression_event(event: ImpressionEvent) -> int:
     context_jsonb = _context_to_jsonb(event.context)
-    rows = [
-        (
-            event.event_id,
-            event.user_id,
-            event.session_id,
-            event.request_id,
-            event.ts_ms,
-            getattr(event, "server_received_ts_ms", None),
-            item.item_id,
-            item.position,
-            item.feed_id,
-            item.slot,
-            context_jsonb,
-        )
-        for item in event.items
-    ]
-
-    inserted = 0
     with transaction() as conn:
         with conn.cursor() as cur:
-            for row in rows:
-                cur.execute(
-                    """
-                    INSERT INTO impressions (
-                        event_id,
-                        user_id,
-                        session_id,
-                        request_id,
-                        ts_ms,
-                        server_received_ts_ms,
-                        item_id,
-                        position,
-                        feed_id,
-                        slot,
-                        context
-                    )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (event_id, position) DO NOTHING
-                    RETURNING 1
-                    """,
-                    row,
-                )
-                if cur.fetchone() is not None:
-                    inserted += 1
-    return inserted
+            return event_log_repository.insert_impression_event(cur, event, context_jsonb)
 
 
 def persist_watch_event(event: WatchEvent) -> bool:
     context_jsonb = _context_to_jsonb(event.context)
     with transaction() as conn:
         with conn.cursor() as cur:
-            return _insert_watch_event(cur, event, context_jsonb)
+            return event_log_repository.insert_watch_event(cur, event, context_jsonb)
 
 
 def persist_watch_event_and_update_features(
@@ -213,7 +130,7 @@ def persist_watch_event_and_update_features(
 
     with transaction() as conn:
         with conn.cursor() as cur:
-            inserted_watch = _insert_watch_event(cur, event, context_jsonb)
+            inserted_watch = event_log_repository.insert_watch_event(cur, event, context_jsonb)
             if not inserted_watch:
                 return {
                     "inserted_watch": False,
@@ -222,89 +139,17 @@ def persist_watch_event_and_update_features(
                     "feature_weight": weight,
                 }
 
-            cur.execute(
-                """
-                INSERT INTO events (event_id, user_id, item_id, event_type, ts)
-                VALUES (%s, %s, %s, %s, COALESCE(to_timestamp(%s), now()))
-                ON CONFLICT (event_id) DO NOTHING
-                """,
-                (
-                    stream_event_id,
-                    event.user_id,
-                    event.item_id,
-                    event_type,
-                    ts_seconds,
-                ),
-            )
-
-            # Serialize writes per user to keep history position monotonic.
-            cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (event.user_id,))
-
-            cur.execute(
-                """
-                INSERT INTO item_popularity (item_id, score)
-                VALUES (%s, %s)
-                ON CONFLICT (item_id)
-                DO UPDATE SET
-                    score = item_popularity.score + EXCLUDED.score,
-                    updated_at = now()
-                """,
-                (event.item_id, weight),
-            )
-
-            cur.execute(
-                """
-                SELECT item_id
-                FROM user_history
-                WHERE user_id = %s
-                ORDER BY pos DESC
-                LIMIT 1
-                """,
-                (event.user_id,),
-            )
-            prev = cur.fetchone()
-
-            if prev and prev["item_id"] != event.item_id:
-                cur.execute(
-                    """
-                    INSERT INTO co_visitation (prev_item_id, next_item_id, cnt)
-                    VALUES (%s, %s, 1)
-                    ON CONFLICT (prev_item_id, next_item_id)
-                    DO UPDATE SET cnt = co_visitation.cnt + 1
-                    """,
-                    (prev["item_id"], event.item_id),
-                )
-
-            cur.execute(
-                """
-                WITH next_pos AS (
-                    SELECT COALESCE(MAX(pos), 0) + 1 AS pos
-                    FROM user_history
-                    WHERE user_id = %s
-                )
-                INSERT INTO user_history (user_id, pos, item_id, ts)
-                SELECT %s, pos, %s, COALESCE(to_timestamp(%s), now())
-                FROM next_pos
-                """,
-                (
-                    event.user_id,
-                    event.user_id,
-                    event.item_id,
-                    ts_seconds,
-                ),
-            )
-
-            cur.execute(
-                """
-                DELETE FROM user_history
-                WHERE user_id = %s
-                  AND pos <= (
-                    SELECT COALESCE(MAX(pos), 0) - %s
-                    FROM user_history
-                    WHERE user_id = %s
-                  )
-                """,
-                (event.user_id, history_size, event.user_id),
+            feature_repository.apply_feedback_event(
+                cur,
+                event_id=stream_event_id,
+                user_id=event.user_id,
+                item_id=event.item_id,
+                event_type=event_type,
+                ts_seconds=ts_seconds,
+                weight=weight,
+                history_size=history_size,
+                require_inserted_event=False,
+                skip_same_item_transition=True,
             )
 
             return {
@@ -318,48 +163,7 @@ def persist_watch_event_and_update_features(
 def get_baseline_kpi_snapshot(days: int = 7) -> dict:
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                """
-                WITH bounds AS (
-                    SELECT now() - (%s * interval '1 day') AS since_ts
-                ),
-                recent_impressions AS (
-                    SELECT i.*
-                    FROM impressions i
-                    CROSS JOIN bounds b
-                    WHERE to_timestamp(i.ts_ms / 1000.0) >= b.since_ts
-                ),
-                recent_watches AS (
-                    SELECT w.*
-                    FROM watches w
-                    CROSS JOIN bounds b
-                    WHERE to_timestamp(w.ts_ms / 1000.0) >= b.since_ts
-                ),
-                watched_impressions AS (
-                    SELECT DISTINCT i.event_id, i.position
-                    FROM recent_impressions i
-                    INNER JOIN recent_watches w
-                        ON w.user_id = i.user_id
-                       AND w.request_id = i.request_id
-                       AND w.item_id = i.item_id
-                       AND w.ts_ms >= i.ts_ms
-                )
-                SELECT
-                    (SELECT COUNT(*) FROM recent_impressions) AS impressions,
-                    (SELECT COUNT(DISTINCT request_id) FROM recent_impressions) AS requests,
-                    (SELECT COUNT(*) FROM recent_watches) AS watches,
-                    (SELECT COUNT(*) FROM watched_impressions) AS watched_impressions,
-                    (SELECT COALESCE(AVG(watch_time_sec), 0) FROM recent_watches) AS avg_watch_time_sec,
-                    (
-                        SELECT COUNT(DISTINCT item_id)
-                        FROM recent_impressions
-                        WHERE position < 20
-                    ) AS recommended_catalog_top20,
-                    (SELECT COUNT(DISTINCT item_id) FROM item_popularity) AS active_catalog_size
-                """,
-                (days,),
-            )
-            row = cur.fetchone() or {}
+            row = event_log_repository.fetch_baseline_kpi_row(cur, days)
 
     impressions = int(row.get("impressions") or 0)
     watched_impressions = int(row.get("watched_impressions") or 0)

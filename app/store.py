@@ -1,11 +1,11 @@
-from typing import Optional
+from typing import Callable, Optional
 import uuid
 
 if __package__:
-    from .db import get_conn, transaction
+    from .repositories import FeatureRepository
     from .runtime_utils import normalize_unix_ts_seconds
 else:  # pragma: no cover - fallback for direct script execution
-    from db import get_conn, transaction
+    from repositories import FeatureRepository
     from runtime_utils import normalize_unix_ts_seconds
 
 
@@ -15,9 +15,35 @@ WEIGHTS = {
     "purchase": 10,
 }
 
+
+def _resolve_db_context_factories():
+    if __package__:
+        from .db import get_conn, transaction
+    else:  # pragma: no cover - fallback for direct script execution
+        from db import get_conn, transaction
+    return get_conn, transaction
+
+
 class FeatureStore:
-    def __init__(self, history_size: int = 20):
+    def __init__(
+        self,
+        history_size: int = 20,
+        repository: Optional[FeatureRepository] = None,
+        *,
+        get_conn_factory: Optional[Callable] = None,
+        transaction_factory: Optional[Callable] = None,
+    ):
         self.history_size = history_size
+        self.repository = repository or FeatureRepository()
+
+        if get_conn_factory is None or transaction_factory is None:
+            default_get_conn, default_transaction = _resolve_db_context_factories()
+            if get_conn_factory is None:
+                get_conn_factory = default_get_conn
+            if transaction_factory is None:
+                transaction_factory = default_transaction
+        self._get_conn = get_conn_factory
+        self._transaction = transaction_factory
 
     def add_event(
         self,
@@ -31,179 +57,49 @@ class FeatureStore:
         weight = WEIGHTS[event_type]
         ts_seconds = normalize_unix_ts_seconds(ts)
 
-        with transaction() as conn:
+        with self._transaction() as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO events (event_id, user_id, item_id, event_type, ts)
-                    VALUES (%s, %s, %s, %s, COALESCE(to_timestamp(%s), now()))
-                    ON CONFLICT (event_id) DO NOTHING
-                    RETURNING id
-                    """,
-                    (event_id, user_id, item_id, event_type, ts_seconds),
+                return self.repository.apply_feedback_event(
+                    cur,
+                    event_id=event_id,
+                    user_id=user_id,
+                    item_id=item_id,
+                    event_type=event_type,
+                    ts_seconds=ts_seconds,
+                    weight=weight,
+                    history_size=self.history_size,
+                    require_inserted_event=True,
+                    skip_same_item_transition=False,
                 )
-                inserted = cur.fetchone() is not None
-                if not inserted:
-                    return False
-
-                # Serialize writes per user to keep history position monotonic.
-                cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (user_id,))
-
-                cur.execute(
-                    """
-                    INSERT INTO item_popularity (item_id, score)
-                    VALUES (%s, %s)
-                    ON CONFLICT (item_id)
-                    DO UPDATE SET
-                        score = item_popularity.score + EXCLUDED.score,
-                        updated_at = now()
-                    """,
-                    (item_id, weight),
-                )
-
-                cur.execute(
-                    """
-                    SELECT item_id
-                    FROM user_history
-                    WHERE user_id = %s
-                    ORDER BY pos DESC
-                    LIMIT 1
-                    """,
-                    (user_id,),
-                )
-                prev = cur.fetchone()
-
-                if prev:
-                    cur.execute(
-                        """
-                        INSERT INTO co_visitation (prev_item_id, next_item_id, cnt)
-                        VALUES (%s, %s, 1)
-                        ON CONFLICT (prev_item_id, next_item_id)
-                        DO UPDATE SET cnt = co_visitation.cnt + 1
-                        """,
-                        (prev["item_id"], item_id),
-                    )
-
-                cur.execute(
-                    """
-                    WITH next_pos AS (
-                        SELECT COALESCE(MAX(pos), 0) + 1 AS pos
-                        FROM user_history
-                        WHERE user_id = %s
-                    )
-                    INSERT INTO user_history (user_id, pos, item_id, ts)
-                    SELECT %s, pos, %s, COALESCE(to_timestamp(%s), now())
-                    FROM next_pos
-                    """,
-                    (user_id, user_id, item_id, ts_seconds),
-                )
-
-                cur.execute(
-                    """
-                    DELETE FROM user_history
-                    WHERE user_id = %s
-                      AND pos <= (
-                        SELECT COALESCE(MAX(pos), 0) - %s
-                        FROM user_history
-                        WHERE user_id = %s
-                      )
-                    """,
-                    (user_id, self.history_size, user_id),
-                )
-        return True
 
     def get_user_history(self, user_id: str):
-        with get_conn() as conn:
+        with self._get_conn() as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT item_id
-                    FROM user_history
-                    WHERE user_id = %s
-                    ORDER BY pos ASC
-                    """,
-                    (user_id,),
-                )
-                rows = cur.fetchall()
-        return [row["item_id"] for row in rows]
+                return self.repository.get_user_history(cur, user_id)
 
     def get_related_items(self, item_id: str, limit: Optional[int] = None):
-        with get_conn() as conn:
+        with self._get_conn() as conn:
             with conn.cursor() as cur:
-                if limit is None:
-                    cur.execute(
-                        """
-                        SELECT next_item_id, cnt
-                        FROM co_visitation
-                        WHERE prev_item_id = %s
-                        ORDER BY cnt DESC
-                        """,
-                        (item_id,),
-                    )
-                else:
-                    cur.execute(
-                        """
-                        SELECT next_item_id, cnt
-                        FROM co_visitation
-                        WHERE prev_item_id = %s
-                        ORDER BY cnt DESC
-                        LIMIT %s
-                        """,
-                        (item_id, limit),
-                    )
-                rows = cur.fetchall()
-        return {row["next_item_id"]: row["cnt"] for row in rows}
+                return self.repository.get_related_items(cur, item_id, limit)
 
     def get_related_items_for_targets(self, item_id: str, target_item_ids):
         if not target_item_ids:
             return {}
-        with get_conn() as conn:
+        with self._get_conn() as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT next_item_id, cnt
-                    FROM co_visitation
-                    WHERE prev_item_id = %s
-                      AND next_item_id = ANY(%s)
-                    """,
-                    (item_id, list(target_item_ids)),
-                )
-                rows = cur.fetchall()
-        return {row["next_item_id"]: row["cnt"] for row in rows}
+                return self.repository.get_related_items_for_targets(cur, item_id, target_item_ids)
 
     def get_popularity_scores(self, limit: Optional[int] = None):
-        with get_conn() as conn:
+        with self._get_conn() as conn:
             with conn.cursor() as cur:
-                if limit is None:
-                    cur.execute("SELECT item_id, score FROM item_popularity ORDER BY score DESC")
-                else:
-                    cur.execute(
-                        """
-                        SELECT item_id, score
-                        FROM item_popularity
-                        ORDER BY score DESC
-                        LIMIT %s
-                        """,
-                        (limit,),
-                    )
-                rows = cur.fetchall()
-        return {row["item_id"]: row["score"] for row in rows}
+                return self.repository.get_popularity_scores(cur, limit)
 
     def get_popularity_scores_for_items(self, item_ids):
         if not item_ids:
             return {}
-        with get_conn() as conn:
+        with self._get_conn() as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT item_id, score
-                    FROM item_popularity
-                    WHERE item_id = ANY(%s)
-                    """,
-                    (list(item_ids),),
-                )
-                rows = cur.fetchall()
-        return {row["item_id"]: row["score"] for row in rows}
+                return self.repository.get_popularity_scores_for_items(cur, item_ids)
 
     def retrieve_candidates(self, user_id: str, limit: int = 200):
         history = self.get_user_history(user_id)
