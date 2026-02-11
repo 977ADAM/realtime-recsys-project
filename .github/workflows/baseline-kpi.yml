@@ -1,0 +1,67 @@
+name: Baseline KPI Snapshot
+
+on:
+  workflow_dispatch:
+    inputs:
+      days:
+        description: Baseline window in days
+        required: false
+        default: "7"
+  schedule:
+    - cron: "0 6 * * *"
+
+jobs:
+  snapshot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      RECSYS_BASE_URL: ${{ secrets.RECSYS_BASE_URL }}
+      WINDOW_DAYS: ${{ github.event.inputs.days }}
+      MIN_SLA_SAMPLES: "100"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check configuration
+        run: |
+          if [ -z "$RECSYS_BASE_URL" ]; then
+            echo "::error::RECSYS_BASE_URL secret is empty."
+            exit 1
+          fi
+
+      - name: Fetch snapshots
+        if: env.RECSYS_BASE_URL != ''
+        run: |
+          DAYS="${WINDOW_DAYS:-7}"
+          BASE_URL="${RECSYS_BASE_URL%/}"
+          curl -fsS "${BASE_URL}/analytics/baseline?days=${DAYS}" -o baseline-kpi.json
+          curl -fsS "${BASE_URL}/contract" -o contract.json
+          curl -fsS "${BASE_URL}/metrics/reco" -o reco-metrics.json
+          cat baseline-kpi.json
+
+      - name: Evaluate KPI/SLA guardrails
+        if: env.RECSYS_BASE_URL != ''
+        run: |
+          python src/check_guardrails.py \
+            --baseline-json baseline-kpi.json \
+            --contract-json contract.json \
+            --reco-metrics-json reco-metrics.json \
+            --min-sla-samples "${MIN_SLA_SAMPLES}" \
+            --output-json guardrail-report.json
+
+      - name: Upload snapshot artifact
+        if: env.RECSYS_BASE_URL != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: baseline-kpi-${{ github.run_id }}
+          path: |
+            baseline-kpi.json
+            contract.json
+            reco-metrics.json
+            guardrail-report.json

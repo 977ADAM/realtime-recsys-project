@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 import time
 import uuid
 from typing import Optional
@@ -12,15 +13,14 @@ if __package__:
     from .db import (
         close_pool,
         get_baseline_kpi_snapshot,
+        get_outbox_snapshot,
         init_db,
         ping_db,
         persist_impression_event,
-        persist_watch_event_and_update_features,
+        persist_watch_event,
     )
-    from .event_bus import KafkaEventBus
     from .observability import RecoMetricsWindow
     from .prom_metrics import (
-        observe_watch_event_to_feature_latency,
         observe_reco_request,
         observe_reco_stage_latency,
         prometheus_content_type,
@@ -46,15 +46,14 @@ else:  # pragma: no cover - fallback for direct script execution
     from db import (
         close_pool,
         get_baseline_kpi_snapshot,
+        get_outbox_snapshot,
         init_db,
         ping_db,
         persist_impression_event,
-        persist_watch_event_and_update_features,
+        persist_watch_event,
     )
-    from event_bus import KafkaEventBus
     from observability import RecoMetricsWindow
     from prom_metrics import (
-        observe_watch_event_to_feature_latency,
         observe_reco_request,
         observe_reco_stage_latency,
         prometheus_content_type,
@@ -88,10 +87,11 @@ RECO_BACKGROUND_SHUTDOWN_TIMEOUT_SEC = positive_int_env(
     "RECO_BACKGROUND_SHUTDOWN_TIMEOUT_SEC",
     5,
 )
+WATCH_FEATURE_UPDATE_MODE = os.getenv("WATCH_FEATURE_UPDATE_MODE", "async_consumer").strip().lower() or "async_consumer"
+EVENT_BACKBONE_MODE = "transactional_outbox"
 
 store = FeatureStore()
 reco_metrics = RecoMetricsWindow()
-event_bus = KafkaEventBus()
 _background_tasks: set[asyncio.Task] = set()
 
 
@@ -111,14 +111,12 @@ async def startup():
                 exc,
             )
 
-    await event_bus.start()
     await anyio.to_thread.run_sync(store.start_cache)
 
 
 @app.on_event("shutdown")
 async def shutdown():
     await _drain_background_tasks()
-    await event_bus.stop()
     await anyio.to_thread.run_sync(store.stop_cache)
     close_pool()
 
@@ -175,9 +173,10 @@ def prometheus_metrics():
 
 @app.get("/healthz")
 def healthcheck():
+    outbox_snapshot = _safe_outbox_snapshot() if ping_db() else None
     return {
         "status": "ok",
-        "event_bus": event_bus.snapshot(),
+        "event_backbone": {"mode": EVENT_BACKBONE_MODE, "outbox": outbox_snapshot},
         "online_cache": store.cache_snapshot(),
     }
 
@@ -185,22 +184,19 @@ def healthcheck():
 @app.get("/readyz")
 async def readiness_check():
     db_ready = ping_db()
-    if event_bus.enabled and not event_bus.is_ready:
-        await event_bus.start()
     if not store.cache_ready():
         await anyio.to_thread.run_sync(store.start_cache)
-    kafka_ready = (not event_bus.enabled) or event_bus.is_ready
     cache_ready = store.cache_ready()
-    ready = db_ready and kafka_ready and cache_ready
+    ready = db_ready and cache_ready
+    outbox_snapshot = _safe_outbox_snapshot() if db_ready else None
 
     payload = {
         "ready": ready,
         "checks": {
             "db": db_ready,
-            "event_bus": kafka_ready,
             "online_cache": cache_ready,
         },
-        "event_bus": event_bus.snapshot(),
+        "event_backbone": {"mode": EVENT_BACKBONE_MODE, "outbox": outbox_snapshot},
         "online_cache": store.cache_snapshot(),
     }
 
@@ -260,12 +256,20 @@ async def _persist_impression(evt: ImpressionEvent) -> int:
     return await anyio.to_thread.run_sync(persist_impression_event, evt)
 
 
-async def _persist_watch(evt: WatchEvent) -> dict:
-    return await anyio.to_thread.run_sync(persist_watch_event_and_update_features, evt)
+async def _persist_watch(evt: WatchEvent) -> bool:
+    return await anyio.to_thread.run_sync(persist_watch_event, evt)
 
 
 def _with_server_received_ts(event: ImpressionEvent | WatchEvent) -> ImpressionEvent | WatchEvent:
     return event.model_copy(update={"server_received_ts_ms": now_ms()})
+
+
+def _safe_outbox_snapshot():
+    try:
+        return get_outbox_snapshot()
+    except Exception as exc:
+        logger.warning("Failed to read outbox snapshot (%s: %s)", exc.__class__.__name__, exc)
+        return {"error": f"{exc.__class__.__name__}: {exc}"}
 
 
 def _track_background_task(task: asyncio.Task) -> None:
@@ -306,18 +310,10 @@ async def _drain_background_tasks() -> None:
         )
 
 
-async def _persist_and_publish_impression(payload: ImpressionEvent, req_id: str, user_id: str) -> bool:
+async def _persist_impression_to_outbox(payload: ImpressionEvent, req_id: str, user_id: str) -> bool:
     started_at = time.perf_counter()
     try:
         inserted_rows = await _persist_impression(payload)
-        if inserted_rows > 0:
-            kafka_published = await event_bus.publish_impression(payload)
-            if event_bus.enabled and not kafka_published:
-                logger.warning(
-                    "DB insert succeeded but Kafka publish failed for auto impression request_id=%s user_id=%s",
-                    req_id,
-                    user_id,
-                )
     except Exception:
         logger.exception(
             "Failed to auto-log impressions for request_id=%s user_id=%s",
@@ -328,7 +324,7 @@ async def _persist_and_publish_impression(payload: ImpressionEvent, req_id: str,
     finally:
         observe_reco_stage_latency("impression_log", (time.perf_counter() - started_at) * 1000.0)
 
-    return True
+    return inserted_rows > 0
 
 
 @app.post("/log/impression")
@@ -339,15 +335,11 @@ async def log_impression(evt: ImpressionEvent):
     except Exception as exc:
         raise HTTPException(status_code=503, detail="failed to persist impression event") from exc
 
-    kafka_published = False
-    if inserted_rows > 0:
-        kafka_published = await event_bus.publish_impression(payload)
-
     return {
         "status": "ok" if inserted_rows > 0 else "duplicate",
         "inserted_rows": inserted_rows,
-        "mode": event_bus.mode,
-        "event_bus_published": kafka_published,
+        "event_backbone_mode": EVENT_BACKBONE_MODE,
+        "outbox_enqueued": bool(inserted_rows > 0),
     }
 
 
@@ -355,26 +347,16 @@ async def log_impression(evt: ImpressionEvent):
 async def log_watch(evt: WatchEvent):
     payload = _with_server_received_ts(evt)
     try:
-        persist_result = await _persist_watch(payload)
+        inserted_watch = await _persist_watch(payload)
     except Exception as exc:
         raise HTTPException(status_code=503, detail="failed to persist watch event") from exc
 
-    inserted_watch = bool(persist_result.get("inserted_watch"))
-    feature_updated = bool(persist_result.get("feature_updated"))
-    if inserted_watch and feature_updated:
-        observe_watch_event_to_feature_latency(max(now_ms() - payload.ts_ms, 0.0))
-        await anyio.to_thread.run_sync(store.invalidate_user_history_cache, payload.user_id)
-        await anyio.to_thread.run_sync(store.invalidate_popularity_cache)
-
-    kafka_published = False
-    if inserted_watch:
-        kafka_published = await event_bus.publish_watch(payload)
-
     return {
         "status": "ok" if inserted_watch else "duplicate",
-        "feature_updated": feature_updated,
-        "mode": event_bus.mode,
-        "event_bus_published": kafka_published,
+        "feature_update_mode": WATCH_FEATURE_UPDATE_MODE,
+        "feature_updated": False,
+        "event_backbone_mode": EVENT_BACKBONE_MODE,
+        "outbox_enqueued": bool(inserted_watch),
     }
 
 
@@ -411,10 +393,10 @@ async def get_reco(
         )
         payload = _with_server_received_ts(imp_evt)
         if RECO_ASYNC_IMPRESSION_LOGGING:
-            _schedule_background(_persist_and_publish_impression(payload, req_id, user_id))
+            _schedule_background(_persist_impression_to_outbox(payload, req_id, user_id))
             observe_reco_stage_latency("impression_schedule", 0.0)
         else:
-            await _persist_and_publish_impression(payload, req_id, user_id)
+            await _persist_impression_to_outbox(payload, req_id, user_id)
     elif x_autolog_impressions:
         logger.debug(
             "Skipping auto-log impressions for request_id=%s because recommendation list is empty",
@@ -432,41 +414,23 @@ async def get_reco(
 @app.post("/log/batch")
 async def log_batch(batch: EventBatch):
     inserted_events = 0
-    event_bus_published = 0
-    users_with_feature_updates = set()
-    has_popularity_updates = False
     try:
         for event in batch.events:
             payload = _with_server_received_ts(event)
             if event.event_type == "impression":
                 inserted_impression = await _persist_impression(payload)
                 inserted_events += int(inserted_impression > 0)
-                if inserted_impression > 0:
-                    event_bus_published += int(await event_bus.publish_impression(payload))
             else:
-                watch_result = await _persist_watch(payload)
-                inserted_watch = bool(watch_result.get("inserted_watch"))
-                feature_updated = bool(watch_result.get("feature_updated"))
+                inserted_watch = await _persist_watch(payload)
                 inserted_events += int(inserted_watch)
-                if inserted_watch and feature_updated:
-                    observe_watch_event_to_feature_latency(max(now_ms() - payload.ts_ms, 0.0))
-                    users_with_feature_updates.add(payload.user_id)
-                    has_popularity_updates = True
-                if inserted_watch:
-                    event_bus_published += int(await event_bus.publish_watch(payload))
     except Exception as exc:
         raise HTTPException(status_code=503, detail="failed to persist batch events") from exc
-
-    if users_with_feature_updates:
-        for user_id in users_with_feature_updates:
-            await anyio.to_thread.run_sync(store.invalidate_user_history_cache, user_id)
-    if has_popularity_updates:
-        await anyio.to_thread.run_sync(store.invalidate_popularity_cache)
 
     return {
         "status": "ok",
         "count": len(batch.events),
         "inserted_events": inserted_events,
-        "mode": event_bus.mode,
-        "event_bus_published": event_bus_published,
+        "event_backbone_mode": EVENT_BACKBONE_MODE,
+        "outbox_enqueued": inserted_events,
+        "feature_update_mode": WATCH_FEATURE_UPDATE_MODE,
     }

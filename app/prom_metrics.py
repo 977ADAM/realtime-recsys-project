@@ -96,6 +96,54 @@ RECO_STAGE_LATENCY_MS = Histogram(
     buckets=_LAG_BUCKETS_MS,
 )
 
+OUTBOX_RELAY_PUBLISHED_TOTAL = Counter(
+    "reco_outbox_relay_published_total",
+    "Outbox relay successful publish count.",
+    labelnames=("topic",),
+)
+
+OUTBOX_RELAY_FAILED_TOTAL = Counter(
+    "reco_outbox_relay_failed_total",
+    "Outbox relay publish failures.",
+    labelnames=("topic",),
+)
+
+OUTBOX_RELAY_EVENT_LAG_MS = Histogram(
+    "reco_outbox_relay_event_lag_ms",
+    "Lag between outbox event creation and publish attempt.",
+    buckets=_LAG_BUCKETS_MS,
+)
+
+OUTBOX_BACKLOG_EVENTS = Gauge(
+    "reco_outbox_backlog_events",
+    "Outbox backlog event count by status.",
+    labelnames=("status",),
+)
+
+OUTBOX_BACKLOG_OLDEST_LAG_MS = Gauge(
+    "reco_outbox_backlog_oldest_lag_ms",
+    "Lag of the oldest pending outbox event.",
+)
+
+CONSUMER_PROCESSED_TOTAL = Counter(
+    "reco_feature_consumer_processed_total",
+    "Feature consumer processed events by topic and status.",
+    labelnames=("topic", "status"),
+)
+
+CONSUMER_EVENT_LAG_MS = Histogram(
+    "reco_feature_consumer_event_lag_ms",
+    "Lag between Kafka message timestamp and consumer processing time.",
+    labelnames=("topic",),
+    buckets=_LAG_BUCKETS_MS,
+)
+
+CONSUMER_PARTITION_LAG = Gauge(
+    "reco_feature_consumer_partition_lag",
+    "Kafka lag per consumer partition.",
+    labelnames=("topic", "partition"),
+)
+
 
 def observe_reco_request(latency_ms: float, status_code: int) -> None:
     status_family = f"{max(status_code, 0) // 100}xx"
@@ -109,6 +157,36 @@ def observe_watch_event_to_feature_latency(latency_ms: float) -> None:
 
 def observe_reco_stage_latency(stage: str, latency_ms: float) -> None:
     RECO_STAGE_LATENCY_MS.labels(stage=stage).observe(max(float(latency_ms), 0.0))
+
+
+def observe_outbox_relay_published(topic: str) -> None:
+    OUTBOX_RELAY_PUBLISHED_TOTAL.labels(topic=topic).inc()
+
+
+def observe_outbox_relay_failed(topic: str) -> None:
+    OUTBOX_RELAY_FAILED_TOTAL.labels(topic=topic).inc()
+
+
+def observe_outbox_relay_event_lag(latency_ms: float) -> None:
+    OUTBOX_RELAY_EVENT_LAG_MS.observe(max(float(latency_ms), 0.0))
+
+
+def set_outbox_backlog_metrics(snapshot: dict) -> None:
+    for status in ("pending", "publishing", "dead"):
+        OUTBOX_BACKLOG_EVENTS.labels(status=status).set(float(snapshot.get(status, 0) or 0))
+    OUTBOX_BACKLOG_OLDEST_LAG_MS.set(float(snapshot.get("oldest_lag_ms", 0) or 0))
+
+
+def observe_consumer_processed(topic: str, status: str) -> None:
+    CONSUMER_PROCESSED_TOTAL.labels(topic=topic, status=status).inc()
+
+
+def observe_consumer_event_lag(topic: str, latency_ms: float) -> None:
+    CONSUMER_EVENT_LAG_MS.labels(topic=topic).observe(max(float(latency_ms), 0.0))
+
+
+def set_consumer_partition_lag(topic: str, partition: int, lag: int) -> None:
+    CONSUMER_PARTITION_LAG.labels(topic=topic, partition=str(int(partition))).set(float(max(int(lag), 0)))
 
 
 def prometheus_payload() -> Optional[bytes]:

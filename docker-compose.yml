@@ -17,7 +17,7 @@ services:
     environment:
       DATABASE_URL: ${DATABASE_URL:-postgresql://recsys:recsys_change_me@postgres:5432/recsys}
       DB_INIT_ON_STARTUP: ${DB_INIT_ON_STARTUP:-true}
-      KAFKA_DUAL_WRITE_ENABLED: ${KAFKA_DUAL_WRITE_ENABLED:-true}
+      WATCH_FEATURE_UPDATE_MODE: ${WATCH_FEATURE_UPDATE_MODE:-async_consumer}
       KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
       KAFKA_TOPIC_IMPRESSIONS: ${KAFKA_TOPIC_IMPRESSIONS:-recsys.impressions.v1}
       KAFKA_TOPIC_WATCHES: ${KAFKA_TOPIC_WATCHES:-recsys.watches.v1}
@@ -30,10 +30,79 @@ services:
       ONLINE_CACHE_HISTORY_TTL_SEC: ${ONLINE_CACHE_HISTORY_TTL_SEC:-20}
       ONLINE_CACHE_RELATED_TTL_SEC: ${ONLINE_CACHE_RELATED_TTL_SEC:-30}
       ONLINE_CACHE_POPULARITY_TTL_SEC: ${ONLINE_CACHE_POPULARITY_TTL_SEC:-5}
+      OUTBOX_MAX_ATTEMPTS: ${OUTBOX_MAX_ATTEMPTS:-25}
     command:
       - sh
       - -c
       - uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers ${UVICORN_WORKERS:-2}
+
+  outbox-relay:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: recsys-outbox-relay
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql://recsys:recsys_change_me@postgres:5432/recsys}
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
+      KAFKA_TOPIC_IMPRESSIONS: ${KAFKA_TOPIC_IMPRESSIONS:-recsys.impressions.v1}
+      KAFKA_TOPIC_WATCHES: ${KAFKA_TOPIC_WATCHES:-recsys.watches.v1}
+      KAFKA_CLIENT_ID: ${KAFKA_CLIENT_ID:-recsys-outbox-relay}
+      KAFKA_REQUEST_TIMEOUT_MS: ${KAFKA_REQUEST_TIMEOUT_MS:-15000}
+      OUTBOX_RELAY_POLL_INTERVAL_MS: ${OUTBOX_RELAY_POLL_INTERVAL_MS:-500}
+      OUTBOX_RELAY_BATCH_SIZE: ${OUTBOX_RELAY_BATCH_SIZE:-200}
+      OUTBOX_RELAY_LEASE_SEC: ${OUTBOX_RELAY_LEASE_SEC:-30}
+      OUTBOX_RELAY_BASE_RETRY_SEC: ${OUTBOX_RELAY_BASE_RETRY_SEC:-1}
+      OUTBOX_RELAY_MAX_RETRY_SEC: ${OUTBOX_RELAY_MAX_RETRY_SEC:-60}
+      PROMETHEUS_METRICS_ENABLED: ${PROMETHEUS_METRICS_ENABLED:-false}
+      METRICS_HOST: ${METRICS_HOST:-0.0.0.0}
+      METRICS_PORT: ${OUTBOX_RELAY_METRICS_PORT:-9109}
+    command:
+      - python
+      - src/outbox_relay.py
+    ports:
+      - "${OUTBOX_RELAY_METRICS_PORT:-9109}:${OUTBOX_RELAY_METRICS_PORT:-9109}"
+
+  feature-consumer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: recsys-feature-consumer
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+      redis:
+        condition: service_started
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql://recsys:recsys_change_me@postgres:5432/recsys}
+      KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
+      KAFKA_TOPIC_IMPRESSIONS: ${KAFKA_TOPIC_IMPRESSIONS:-recsys.impressions.v1}
+      KAFKA_TOPIC_WATCHES: ${KAFKA_TOPIC_WATCHES:-recsys.watches.v1}
+      FEATURE_CONSUMER_GROUP_ID: ${FEATURE_CONSUMER_GROUP_ID:-recsys-feature-consumer-v1}
+      FEATURE_CONSUMER_CLIENT_ID: ${FEATURE_CONSUMER_CLIENT_ID:-recsys-feature-consumer}
+      FEATURE_CONSUMER_POLL_TIMEOUT_MS: ${FEATURE_CONSUMER_POLL_TIMEOUT_MS:-1000}
+      FEATURE_CONSUMER_MAX_POLL_RECORDS: ${FEATURE_CONSUMER_MAX_POLL_RECORDS:-500}
+      STREAM_FEATURE_HISTORY_SIZE: ${STREAM_FEATURE_HISTORY_SIZE:-20}
+      ONLINE_CACHE_ENABLED: ${ONLINE_CACHE_ENABLED:-true}
+      ONLINE_CACHE_BACKEND: ${ONLINE_CACHE_BACKEND:-redis}
+      ONLINE_CACHE_REDIS_URL: ${ONLINE_CACHE_REDIS_URL:-redis://redis:6379/0}
+      ONLINE_CACHE_REDIS_TIMEOUT_SEC: ${ONLINE_CACHE_REDIS_TIMEOUT_SEC:-1}
+      PROMETHEUS_METRICS_ENABLED: ${PROMETHEUS_METRICS_ENABLED:-false}
+      METRICS_HOST: ${METRICS_HOST:-0.0.0.0}
+      METRICS_PORT: ${FEATURE_CONSUMER_METRICS_PORT:-9110}
+    command:
+      - python
+      - src/feature_consumer.py
+    ports:
+      - "${FEATURE_CONSUMER_METRICS_PORT:-9110}:${FEATURE_CONSUMER_METRICS_PORT:-9110}"
 
   postgres:
     image: postgres:16-alpine
