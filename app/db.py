@@ -4,6 +4,7 @@ import json
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Optional, Tuple
+from dotenv import load_dotenv
 
 import psycopg
 from psycopg.rows import dict_row
@@ -99,6 +100,13 @@ _CLAIM_OUTBOX_EVENTS_SQL = """
 
 
 def _database_url() -> str:
+    value = os.getenv("DATABASE_URL", "").strip()
+    if value:
+        return value
+
+    project_env = Path(__file__).resolve().parents[1] / ".env"
+    load_dotenv(dotenv_path=project_env, override=False)
+    load_dotenv(override=False)
     value = os.getenv("DATABASE_URL", "").strip()
     if value:
         return value
