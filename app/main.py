@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import time
 import uuid
@@ -21,11 +22,12 @@ if __package__:
     from .prom_metrics import (
         observe_watch_event_to_feature_latency,
         observe_reco_request,
+        observe_reco_stage_latency,
         prometheus_content_type,
         prometheus_payload,
         start_metrics_http_server,
     )
-    from .runtime_utils import env_bool, now_ms
+    from .runtime_utils import env_bool, now_ms, positive_int_env
     from .ranking import rank_items_by_features
     from .recommend import recommend
     from .schemas import (
@@ -54,11 +56,12 @@ else:  # pragma: no cover - fallback for direct script execution
     from prom_metrics import (
         observe_watch_event_to_feature_latency,
         observe_reco_request,
+        observe_reco_stage_latency,
         prometheus_content_type,
         prometheus_payload,
         start_metrics_http_server,
     )
-    from runtime_utils import env_bool, now_ms
+    from runtime_utils import env_bool, now_ms, positive_int_env
     from ranking import rank_items_by_features
     from recommend import recommend
     from schemas import (
@@ -80,10 +83,16 @@ app = FastAPI(title=APP_NAME)
 logger = logging.getLogger(__name__)
 
 DB_INIT_ON_STARTUP = env_bool("DB_INIT_ON_STARTUP", True)
+RECO_ASYNC_IMPRESSION_LOGGING = env_bool("RECO_ASYNC_IMPRESSION_LOGGING", True)
+RECO_BACKGROUND_SHUTDOWN_TIMEOUT_SEC = positive_int_env(
+    "RECO_BACKGROUND_SHUTDOWN_TIMEOUT_SEC",
+    5,
+)
 
 store = FeatureStore()
 reco_metrics = RecoMetricsWindow()
 event_bus = KafkaEventBus()
+_background_tasks: set[asyncio.Task] = set()
 
 
 @app.on_event("startup")
@@ -108,6 +117,7 @@ async def startup():
 
 @app.on_event("shutdown")
 async def shutdown():
+    await _drain_background_tasks()
     await event_bus.stop()
     await anyio.to_thread.run_sync(store.stop_cache)
     close_pool()
@@ -225,11 +235,24 @@ def retrieve_candidates(user_id: str, k_retrieval: int = 200) -> list[str]:
     return store.retrieve_candidates(user_id=user_id, limit=k_retrieval)
 
 
-def rank_candidates(user_id: str, candidates: list[str], k: int) -> list[str]:
+def retrieve_candidates_and_history(user_id: str, k_retrieval: int = 200) -> tuple[list[str], list[str]]:
+    return store.retrieve_candidates_and_history(user_id=user_id, limit=k_retrieval)
+
+
+def rank_candidates(
+    user_id: str,
+    candidates: list[str],
+    k: int,
+    user_history: Optional[list[str]] = None,
+) -> list[str]:
     if not candidates:
         return []
 
-    features = store.get_features_for_ranking(user_id=user_id, item_ids=candidates)
+    features = store.get_features_for_ranking(
+        user_id=user_id,
+        item_ids=candidates,
+        user_history=user_history,
+    )
     return rank_items_by_features(candidates=candidates, features=features, k=k)
 
 
@@ -243,6 +266,69 @@ async def _persist_watch(evt: WatchEvent) -> dict:
 
 def _with_server_received_ts(event: ImpressionEvent | WatchEvent) -> ImpressionEvent | WatchEvent:
     return event.model_copy(update={"server_received_ts_ms": now_ms()})
+
+
+def _track_background_task(task: asyncio.Task) -> None:
+    _background_tasks.add(task)
+
+    def _cleanup(done_task: asyncio.Task) -> None:
+        _background_tasks.discard(done_task)
+        if done_task.cancelled():
+            return
+        exc = done_task.exception()
+        if exc is not None:
+            logger.exception("Background task failed: %s", exc)
+
+    task.add_done_callback(_cleanup)
+
+
+def _schedule_background(coro) -> None:
+    task = asyncio.create_task(coro)
+    _track_background_task(task)
+
+
+async def _drain_background_tasks() -> None:
+    if not _background_tasks:
+        return
+
+    pending = list(_background_tasks)
+    done, still_pending = await asyncio.wait(
+        pending,
+        timeout=RECO_BACKGROUND_SHUTDOWN_TIMEOUT_SEC,
+    )
+    _ = done
+    for task in still_pending:
+        task.cancel()
+    if still_pending:
+        logger.warning(
+            "Cancelled %s outstanding background tasks during shutdown",
+            len(still_pending),
+        )
+
+
+async def _persist_and_publish_impression(payload: ImpressionEvent, req_id: str, user_id: str) -> bool:
+    started_at = time.perf_counter()
+    try:
+        inserted_rows = await _persist_impression(payload)
+        if inserted_rows > 0:
+            kafka_published = await event_bus.publish_impression(payload)
+            if event_bus.enabled and not kafka_published:
+                logger.warning(
+                    "DB insert succeeded but Kafka publish failed for auto impression request_id=%s user_id=%s",
+                    req_id,
+                    user_id,
+                )
+    except Exception:
+        logger.exception(
+            "Failed to auto-log impressions for request_id=%s user_id=%s",
+            req_id,
+            user_id,
+        )
+        return False
+    finally:
+        observe_reco_stage_latency("impression_log", (time.perf_counter() - started_at) * 1000.0)
+
+    return True
 
 
 @app.post("/log/impression")
@@ -301,12 +387,18 @@ async def get_reco(
     user_agent: Optional[str] = Header(default=None, alias="User-Agent"),
 ):
     req_id = new_request_id()
-    candidates = await anyio.to_thread.run_sync(
-        retrieve_candidates,
+
+    retrieval_started = time.perf_counter()
+    candidates, user_history = await anyio.to_thread.run_sync(
+        retrieve_candidates_and_history,
         user_id,
         max(k * 20, 200),
     )
-    items = await anyio.to_thread.run_sync(rank_candidates, user_id, candidates, k)
+    observe_reco_stage_latency("retrieval", (time.perf_counter() - retrieval_started) * 1000.0)
+
+    ranking_started = time.perf_counter()
+    items = await anyio.to_thread.run_sync(rank_candidates, user_id, candidates, k, user_history)
+    observe_reco_stage_latency("ranking", (time.perf_counter() - ranking_started) * 1000.0)
 
     if x_autolog_impressions and items:
         imp_evt = ImpressionEvent(
@@ -318,22 +410,11 @@ async def get_reco(
             context=Context(user_agent=user_agent),
         )
         payload = _with_server_received_ts(imp_evt)
-        try:
-            inserted_rows = await _persist_impression(payload)
-            if inserted_rows > 0:
-                kafka_published = await event_bus.publish_impression(payload)
-                if event_bus.enabled and not kafka_published:
-                    logger.warning(
-                        "DB insert succeeded but Kafka publish failed for auto impression request_id=%s user_id=%s",
-                        req_id,
-                        user_id,
-                    )
-        except Exception:
-            logger.exception(
-                "Failed to auto-log impressions for request_id=%s user_id=%s",
-                req_id,
-                user_id,
-            )
+        if RECO_ASYNC_IMPRESSION_LOGGING:
+            _schedule_background(_persist_and_publish_impression(payload, req_id, user_id))
+            observe_reco_stage_latency("impression_schedule", 0.0)
+        else:
+            await _persist_and_publish_impression(payload, req_id, user_id)
     elif x_autolog_impressions:
         logger.debug(
             "Skipping auto-log impressions for request_id=%s because recommendation list is empty",

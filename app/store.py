@@ -213,8 +213,7 @@ class FeatureStore:
                 popularity = self.repository.get_popularity_scores_for_items(cur, item_ids)
         return self._normalize_score_map(popularity)
 
-    def retrieve_candidates(self, user_id: str, limit: int = 200):
-        history = self.get_user_history(user_id)
+    def _retrieve_candidates_from_history(self, history: list[str], limit: int) -> list[str]:
         seen = set(history)
         scores = {}
 
@@ -240,8 +239,17 @@ class FeatureStore:
         ranked = sorted(scores.items(), key=lambda pair: pair[1], reverse=True)
         return [item_id for item_id, _ in ranked[:limit]]
 
-    def get_features_for_ranking(self, user_id: str, item_ids):
+    def retrieve_candidates(self, user_id: str, limit: int = 200):
         history = self.get_user_history(user_id)
+        return self._retrieve_candidates_from_history(history, limit)
+
+    def retrieve_candidates_and_history(self, user_id: str, limit: int = 200) -> tuple[list[str], list[str]]:
+        history = self.get_user_history(user_id)
+        candidates = self._retrieve_candidates_from_history(history, limit)
+        return candidates, history
+
+    def get_features_for_ranking(self, user_id: str, item_ids, user_history: Optional[list[str]] = None):
+        history = user_history if user_history is not None else self.get_user_history(user_id)
         history_set = set(history)
         last_item = history[-1] if history else None
 

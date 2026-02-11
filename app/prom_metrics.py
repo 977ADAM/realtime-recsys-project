@@ -89,6 +89,13 @@ WATCH_EVENT_TO_FEATURE_LATENCY_MS = Histogram(
     buckets=_LAG_BUCKETS_MS,
 )
 
+RECO_STAGE_LATENCY_MS = Histogram(
+    "reco_stage_latency_ms",
+    "Latency distribution for internal /reco stages.",
+    labelnames=("stage",),
+    buckets=_LAG_BUCKETS_MS,
+)
+
 
 def observe_reco_request(latency_ms: float, status_code: int) -> None:
     status_family = f"{max(status_code, 0) // 100}xx"
@@ -98,6 +105,10 @@ def observe_reco_request(latency_ms: float, status_code: int) -> None:
 
 def observe_watch_event_to_feature_latency(latency_ms: float) -> None:
     WATCH_EVENT_TO_FEATURE_LATENCY_MS.observe(max(float(latency_ms), 0.0))
+
+
+def observe_reco_stage_latency(stage: str, latency_ms: float) -> None:
+    RECO_STAGE_LATENCY_MS.labels(stage=stage).observe(max(float(latency_ms), 0.0))
 
 
 def prometheus_payload() -> Optional[bytes]:

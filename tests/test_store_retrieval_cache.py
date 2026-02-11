@@ -136,6 +136,28 @@ class FeatureStoreRetrievalCacheTests(unittest.TestCase):
 
         self.assertEqual(repo.calls["user_history"], 2)
 
+    def test_retrieve_candidates_and_history_returns_consistent_pair(self):
+        with self._env_patch():
+            store, repo = self._build_store()
+            candidates, history = store.retrieve_candidates_and_history(user_id="user-1", limit=3)
+
+        self.assertEqual(history, ["item-1", "item-3", "item-4"])
+        self.assertEqual(candidates, ["item-9", "item-2", "item-6"])
+        self.assertEqual(repo.calls["user_history"], 1)
+
+    def test_get_features_uses_preloaded_history_without_extra_fetch(self):
+        with self._env_patch():
+            store, repo = self._build_store()
+            history = ["item-1", "item-3", "item-4"]
+            features = store.get_features_for_ranking(
+                user_id="user-1",
+                item_ids=["item-2", "item-6"],
+                user_history=history,
+            )
+
+        self.assertEqual(repo.calls["user_history"], 0)
+        self.assertEqual(set(features.keys()), {"item-2", "item-6"})
+
 
 if __name__ == "__main__":
     unittest.main()
