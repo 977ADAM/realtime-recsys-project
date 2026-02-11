@@ -1,5 +1,4 @@
 import logging
-import os
 import time
 import uuid
 from typing import Optional
@@ -22,6 +21,7 @@ if __package__:
         prometheus_content_type,
         prometheus_payload,
     )
+    from .runtime_utils import env_bool, now_ms
     from .ranking import rank_items_by_features
     from .recommend import recommend
     from .schemas import (
@@ -50,6 +50,7 @@ else:  # pragma: no cover - fallback for direct script execution
         prometheus_content_type,
         prometheus_payload,
     )
+    from runtime_utils import env_bool, now_ms
     from ranking import rank_items_by_features
     from recommend import recommend
     from schemas import (
@@ -70,19 +71,7 @@ APP_NAME = "Real-time Recommender MVP"
 app = FastAPI(title=APP_NAME)
 logger = logging.getLogger(__name__)
 
-
-def _env_bool(name: str, default: bool) -> bool:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
-
-
-def now_ms() -> int:
-    return int(time.time() * 1000)
-
-
-DB_INIT_ON_STARTUP = _env_bool("DB_INIT_ON_STARTUP", True)
+DB_INIT_ON_STARTUP = env_bool("DB_INIT_ON_STARTUP", True)
 
 store = FeatureStore()
 reco_metrics = RecoMetricsWindow()
@@ -201,9 +190,13 @@ async def _persist_watch(evt: WatchEvent) -> dict:
     return await anyio.to_thread.run_sync(persist_watch_event_and_update_features, evt)
 
 
+def _with_server_received_ts(event: ImpressionEvent | WatchEvent) -> ImpressionEvent | WatchEvent:
+    return event.model_copy(update={"server_received_ts_ms": now_ms()})
+
+
 @app.post("/log/impression")
 async def log_impression(evt: ImpressionEvent):
-    payload = evt.model_copy(update={"server_received_ts_ms": now_ms()})
+    payload = _with_server_received_ts(evt)
     try:
         inserted_rows = await _persist_impression(payload)
     except Exception as exc:
@@ -218,7 +211,7 @@ async def log_impression(evt: ImpressionEvent):
 
 @app.post("/log/watch")
 async def log_watch(evt: WatchEvent):
-    payload = evt.model_copy(update={"server_received_ts_ms": now_ms()})
+    payload = _with_server_received_ts(evt)
     try:
         persist_result = await _persist_watch(payload)
     except Exception as exc:
@@ -256,7 +249,7 @@ async def get_reco(
             items=[ImpressionItem(item_id=item, position=pos) for pos, item in enumerate(items)],
             context=Context(user_agent=user_agent),
         )
-        payload = imp_evt.model_copy(update={"server_received_ts_ms": now_ms()})
+        payload = _with_server_received_ts(imp_evt)
         try:
             await _persist_impression(payload)
         except Exception:
@@ -284,7 +277,7 @@ async def log_batch(batch: EventBatch):
     inserted_events = 0
     try:
         for event in batch.events:
-            payload = event.model_copy(update={"server_received_ts_ms": now_ms()})
+            payload = _with_server_received_ts(event)
             if event.event_type == "impression":
                 inserted_events += int(await _persist_impression(payload) > 0)
             else:

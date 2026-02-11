@@ -2,26 +2,12 @@ import logging
 import os
 from typing import Optional
 
+if __package__:
+    from .runtime_utils import env_bool, positive_int_env
+else:  # pragma: no cover - fallback for direct script execution
+    from runtime_utils import env_bool, positive_int_env
 
 logger = logging.getLogger(__name__)
-
-
-def _env_bool(name: str, default: bool) -> bool:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _positive_int_env(name: str, default: int) -> int:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    try:
-        value = int(raw)
-    except ValueError:
-        return default
-    return value if value > 0 else default
 
 
 try:
@@ -125,7 +111,7 @@ def prometheus_content_type() -> str:
 
 
 def start_metrics_http_server() -> bool:
-    if not _env_bool("PROMETHEUS_METRICS_ENABLED", True):
+    if not env_bool("PROMETHEUS_METRICS_ENABLED", True):
         logger.info("Prometheus metrics server is disabled by config")
         return False
 
@@ -134,7 +120,7 @@ def start_metrics_http_server() -> bool:
         return False
 
     host = os.getenv("METRICS_HOST", "0.0.0.0")
-    port = _positive_int_env("METRICS_PORT", 9108)
+    port = positive_int_env("METRICS_PORT", 9108)
     start_http_server(port=port, addr=host)
     logger.info("Metrics server started at http://%s:%s/metrics", host, port)
     return True

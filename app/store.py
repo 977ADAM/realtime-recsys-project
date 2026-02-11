@@ -3,8 +3,10 @@ import uuid
 
 if __package__:
     from .db import get_conn, transaction
+    from .runtime_utils import normalize_unix_ts_seconds
 else:  # pragma: no cover - fallback for direct script execution
     from db import get_conn, transaction
+    from runtime_utils import normalize_unix_ts_seconds
 
 
 WEIGHTS = {
@@ -12,14 +14,6 @@ WEIGHTS = {
     "click": 3,
     "purchase": 10,
 }
-
-
-def _normalize_unix_ts_seconds(ts: Optional[int]) -> Optional[float]:
-    if ts is None:
-        return None
-    # Accept both seconds and milliseconds Unix timestamps.
-    return ts / 1000.0 if ts >= 10**12 else float(ts)
-
 
 class FeatureStore:
     def __init__(self, history_size: int = 20):
@@ -35,7 +29,7 @@ class FeatureStore:
     ) -> bool:
         event_id = event_id or uuid.uuid4().hex
         weight = WEIGHTS[event_type]
-        ts_seconds = _normalize_unix_ts_seconds(ts)
+        ts_seconds = normalize_unix_ts_seconds(ts)
 
         with transaction() as conn:
             with conn.cursor() as cur:

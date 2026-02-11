@@ -1,16 +1,9 @@
-import os
 from dataclasses import dataclass
 
-
-def _positive_int_env(name: str, default: int) -> int:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    try:
-        value = int(raw)
-    except ValueError:
-        return default
-    return value if value > 0 else default
+if __package__:
+    from .runtime_utils import positive_int_env
+else:  # pragma: no cover - fallback for direct script execution
+    from runtime_utils import positive_int_env
 
 
 @dataclass(frozen=True)
@@ -21,9 +14,9 @@ class ContractConfig:
 
 
 CONTRACT = ContractConfig(
-    max_event_future_ms=_positive_int_env("CONTRACT_MAX_EVENT_FUTURE_MS", 5 * 60 * 1000),
-    max_event_age_ms=_positive_int_env("CONTRACT_MAX_EVENT_AGE_MS", 30 * 24 * 60 * 60 * 1000),
-    max_batch_size=_positive_int_env("CONTRACT_MAX_BATCH_SIZE", 1000),
+    max_event_future_ms=positive_int_env("CONTRACT_MAX_EVENT_FUTURE_MS", 5 * 60 * 1000),
+    max_event_age_ms=positive_int_env("CONTRACT_MAX_EVENT_AGE_MS", 30 * 24 * 60 * 60 * 1000),
+    max_batch_size=positive_int_env("CONTRACT_MAX_BATCH_SIZE", 1000),
 )
 
 

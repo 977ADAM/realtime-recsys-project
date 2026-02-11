@@ -1,24 +1,13 @@
 import math
-import os
-import time
 from collections import deque
 from threading import Lock
 
 if __package__:
     from .config import SLA_TARGETS
+    from .runtime_utils import now_ms, positive_int_env
 else:  # pragma: no cover - fallback for direct script execution
     from config import SLA_TARGETS
-
-
-def _positive_int_env(name: str, default: int) -> int:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    try:
-        value = int(raw)
-    except ValueError:
-        return default
-    return value if value > 0 else default
+    from runtime_utils import now_ms, positive_int_env
 
 
 def _percentile(values, q: float):
@@ -36,8 +25,8 @@ def _percentile(values, q: float):
 
 class RecoMetricsWindow:
     def __init__(self):
-        self.window_sec = _positive_int_env("RECO_METRICS_WINDOW_SEC", 3600)
-        self.max_samples = _positive_int_env("RECO_METRICS_MAX_SAMPLES", 50000)
+        self.window_sec = positive_int_env("RECO_METRICS_WINDOW_SEC", 3600)
+        self.max_samples = positive_int_env("RECO_METRICS_MAX_SAMPLES", 50000)
         self._window_ms = self.window_sec * 1000
         self._samples = deque()
         self._lock = Lock()
@@ -50,16 +39,16 @@ class RecoMetricsWindow:
             self._samples.popleft()
 
     def record(self, latency_ms: float, status_code: int) -> None:
-        now_ms = int(time.time() * 1000)
-        sample = (now_ms, float(latency_ms), int(status_code))
+        current_ms = now_ms()
+        sample = (current_ms, float(latency_ms), int(status_code))
         with self._lock:
             self._samples.append(sample)
-            self._prune(now_ms)
+            self._prune(current_ms)
 
     def snapshot(self) -> dict:
-        now_ms = int(time.time() * 1000)
+        current_ms = now_ms()
         with self._lock:
-            self._prune(now_ms)
+            self._prune(current_ms)
             samples = list(self._samples)
 
         latencies = sorted(sample[1] for sample in samples)

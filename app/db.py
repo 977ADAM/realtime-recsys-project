@@ -1,15 +1,17 @@
 import os
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Optional, Tuple
+from typing import Any, Tuple
 
 import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 if __package__:
+    from .runtime_utils import normalize_unix_ts_seconds, positive_int_env
     from .schemas import ImpressionEvent, WatchEvent
 else:  # pragma: no cover - fallback for direct script execution
+    from runtime_utils import normalize_unix_ts_seconds, positive_int_env
     from schemas import ImpressionEvent, WatchEvent
 
 try:
@@ -23,18 +25,7 @@ SCHEMA_PATH = Path(__file__).resolve().parents[1] / "sql" / "schema.sql"
 _pool = None
 
 
-def _positive_int_env(name: str, default: int) -> int:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    try:
-        value = int(raw)
-    except ValueError:
-        return default
-    return value if value > 0 else default
-
-
-STREAM_FEATURE_HISTORY_SIZE = _positive_int_env("STREAM_FEATURE_HISTORY_SIZE", 20)
+STREAM_FEATURE_HISTORY_SIZE = positive_int_env("STREAM_FEATURE_HISTORY_SIZE", 20)
 
 
 def _get_pool():
@@ -109,10 +100,49 @@ def _watch_signal_to_event(event: WatchEvent) -> Tuple[str, int]:
     return "view", 1
 
 
-def _normalize_unix_ts_seconds(ts: Optional[int]) -> Optional[float]:
-    if ts is None:
-        return None
-    return ts / 1000.0 if ts >= 10**12 else float(ts)
+_WATCH_INSERT_SQL = """
+    INSERT INTO watches (
+        event_id,
+        user_id,
+        session_id,
+        request_id,
+        item_id,
+        ts_ms,
+        server_received_ts_ms,
+        watch_time_sec,
+        percent_watched,
+        ended,
+        playback_speed,
+        rebuffer_count,
+        context
+    )
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    ON CONFLICT (event_id) DO NOTHING
+    RETURNING 1
+"""
+
+
+def _watch_insert_params(event: WatchEvent, context_jsonb: Any) -> tuple:
+    return (
+        event.event_id,
+        event.user_id,
+        event.session_id,
+        event.request_id,
+        event.item_id,
+        event.ts_ms,
+        getattr(event, "server_received_ts_ms", None),
+        event.watch_time_sec,
+        event.percent_watched,
+        event.ended,
+        event.playback_speed,
+        event.rebuffer_count,
+        context_jsonb,
+    )
+
+
+def _insert_watch_event(cur, event: WatchEvent, context_jsonb: Any) -> bool:
+    cur.execute(_WATCH_INSERT_SQL, _watch_insert_params(event, context_jsonb))
+    return cur.fetchone() is not None
 
 
 def persist_impression_event(event: ImpressionEvent) -> int:
@@ -168,44 +198,7 @@ def persist_watch_event(event: WatchEvent) -> bool:
     context_jsonb = _context_to_jsonb(event.context)
     with transaction() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO watches (
-                    event_id,
-                    user_id,
-                    session_id,
-                    request_id,
-                    item_id,
-                    ts_ms,
-                    server_received_ts_ms,
-                    watch_time_sec,
-                    percent_watched,
-                    ended,
-                    playback_speed,
-                    rebuffer_count,
-                    context
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (event_id) DO NOTHING
-                RETURNING 1
-                """,
-                (
-                    event.event_id,
-                    event.user_id,
-                    event.session_id,
-                    event.request_id,
-                    event.item_id,
-                    event.ts_ms,
-                    getattr(event, "server_received_ts_ms", None),
-                    event.watch_time_sec,
-                    event.percent_watched,
-                    event.ended,
-                    event.playback_speed,
-                    event.rebuffer_count,
-                    context_jsonb,
-                ),
-            )
-            return cur.fetchone() is not None
+            return _insert_watch_event(cur, event, context_jsonb)
 
 
 def persist_watch_event_and_update_features(
@@ -215,49 +208,12 @@ def persist_watch_event_and_update_features(
     history_size = max(int(history_size), 1)
     context_jsonb = _context_to_jsonb(event.context)
     event_type, weight = _watch_signal_to_event(event)
-    ts_seconds = _normalize_unix_ts_seconds(event.ts_ms)
+    ts_seconds = normalize_unix_ts_seconds(event.ts_ms)
     stream_event_id = f"watch-{event.event_id}"
 
     with transaction() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO watches (
-                    event_id,
-                    user_id,
-                    session_id,
-                    request_id,
-                    item_id,
-                    ts_ms,
-                    server_received_ts_ms,
-                    watch_time_sec,
-                    percent_watched,
-                    ended,
-                    playback_speed,
-                    rebuffer_count,
-                    context
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (event_id) DO NOTHING
-                RETURNING 1
-                """,
-                (
-                    event.event_id,
-                    event.user_id,
-                    event.session_id,
-                    event.request_id,
-                    event.item_id,
-                    event.ts_ms,
-                    getattr(event, "server_received_ts_ms", None),
-                    event.watch_time_sec,
-                    event.percent_watched,
-                    event.ended,
-                    event.playback_speed,
-                    event.rebuffer_count,
-                    context_jsonb,
-                ),
-            )
-            inserted_watch = cur.fetchone() is not None
+            inserted_watch = _insert_watch_event(cur, event, context_jsonb)
             if not inserted_watch:
                 return {
                     "inserted_watch": False,

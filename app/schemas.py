@@ -1,31 +1,27 @@
 import uuid
-import time
 from typing import Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 if __package__:
     from .config import CONTRACT
+    from .runtime_utils import normalize_unix_ts_ms, now_ms
 else:  # pragma: no cover - fallback for direct script execution
     from config import CONTRACT
+    from runtime_utils import normalize_unix_ts_ms, now_ms
 
 
 EventType = Literal["view", "click", "purchase"]
 
 
-def _normalize_to_ms(ts: int) -> int:
-    # Accept seconds for backwards compatibility, normalize to ms for checks.
-    return ts if ts >= 10**12 else ts * 1000
-
-
 def _validate_event_time(ts: int, field_name: str) -> int:
-    normalized = _normalize_to_ms(ts)
-    now = int(time.time() * 1000)
-    if normalized > now + CONTRACT.max_event_future_ms:
+    normalized = normalize_unix_ts_ms(ts)
+    current_ms = now_ms()
+    if normalized > current_ms + CONTRACT.max_event_future_ms:
         raise ValueError(
             f"{field_name} is too far in the future; max_future_ms={CONTRACT.max_event_future_ms}"
         )
-    if normalized < now - CONTRACT.max_event_age_ms:
+    if normalized < current_ms - CONTRACT.max_event_age_ms:
         raise ValueError(
             f"{field_name} is too old; max_event_age_ms={CONTRACT.max_event_age_ms}"
         )
