@@ -1,11 +1,12 @@
 import asyncio
 import logging
 import os
+import re
 import time
 import uuid
+from contextlib import asynccontextmanager
 from typing import Optional
 
-import anyio
 from fastapi import FastAPI, Header, HTTPException, Query, Request, Response
 
 if __package__:
@@ -19,15 +20,18 @@ if __package__:
         persist_impression_event,
         persist_watch_event,
     )
-    from .observability import RecoMetricsWindow
+    from .observability import RecoMetricsWindow, configure_logging, log_context
     from .prom_metrics import (
         observe_reco_request,
         observe_reco_stage_latency,
+        set_api_check_status,
+        set_outbox_backlog_metrics,
         prometheus_content_type,
         prometheus_payload,
         start_metrics_http_server,
     )
-    from .runtime_utils import env_bool, now_ms, positive_int_env
+    from .runtime_utils import env_bool, now_ms, positive_int_env, sanitize_identifier
+    from .security import enforce_runtime_security
     from .ranking import rank_items_by_features
     from .recommend import recommend
     from .schemas import (
@@ -52,15 +56,18 @@ else:  # pragma: no cover - fallback for direct script execution
         persist_impression_event,
         persist_watch_event,
     )
-    from observability import RecoMetricsWindow
+    from observability import RecoMetricsWindow, configure_logging, log_context
     from prom_metrics import (
         observe_reco_request,
         observe_reco_stage_latency,
+        set_api_check_status,
+        set_outbox_backlog_metrics,
         prometheus_content_type,
         prometheus_payload,
         start_metrics_http_server,
     )
-    from runtime_utils import env_bool, now_ms, positive_int_env
+    from runtime_utils import env_bool, now_ms, positive_int_env, sanitize_identifier
+    from security import enforce_runtime_security
     from ranking import rank_items_by_features
     from recommend import recommend
     from schemas import (
@@ -78,8 +85,20 @@ else:  # pragma: no cover - fallback for direct script execution
 
 APP_NAME = "Real-time Recommender MVP"
 
-app = FastAPI(title=APP_NAME)
+configure_logging(component="api")
 logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    await startup()
+    try:
+        yield
+    finally:
+        await shutdown()
+
+
+app = FastAPI(title=APP_NAME, lifespan=lifespan)
 
 DB_INIT_ON_STARTUP = env_bool("DB_INIT_ON_STARTUP", True)
 RECO_ASYNC_IMPRESSION_LOGGING = env_bool("RECO_ASYNC_IMPRESSION_LOGGING", True)
@@ -87,23 +106,44 @@ RECO_BACKGROUND_SHUTDOWN_TIMEOUT_SEC = positive_int_env(
     "RECO_BACKGROUND_SHUTDOWN_TIMEOUT_SEC",
     5,
 )
+RECO_MAX_BACKGROUND_TASKS = positive_int_env("RECO_MAX_BACKGROUND_TASKS", 1000)
+RECO_BACKGROUND_BACKPRESSURE_MODE = (
+    os.getenv("RECO_BACKGROUND_BACKPRESSURE_MODE", "sync").strip().lower() or "sync"
+)
+if RECO_BACKGROUND_BACKPRESSURE_MODE not in {"sync", "drop"}:
+    RECO_BACKGROUND_BACKPRESSURE_MODE = "sync"
 WATCH_FEATURE_UPDATE_MODE = os.getenv("WATCH_FEATURE_UPDATE_MODE", "async_consumer").strip().lower() or "async_consumer"
 EVENT_BACKBONE_MODE = "transactional_outbox"
+_SAFE_HEADER_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{8,128}$")
 
 store = FeatureStore()
 reco_metrics = RecoMetricsWindow()
 _background_tasks: set[asyncio.Task] = set()
 
 
-@app.on_event("startup")
+def _normalized_header_id(raw_value: Optional[str]) -> Optional[str]:
+    if raw_value is None:
+        return None
+    value = raw_value.strip()[:128]
+    if not value:
+        return None
+    if _SAFE_HEADER_ID_PATTERN.match(value) is None:
+        return None
+    return value
+
+
 async def startup():
+    security_issue = enforce_runtime_security(component="api")
+    if security_issue:
+        raise RuntimeError(security_issue)
+
     start_metrics_http_server()
 
     if not DB_INIT_ON_STARTUP:
         logger.info("DB init on startup is disabled; set DB_INIT_ON_STARTUP=true to auto-apply schema")
     else:
         try:
-            await anyio.to_thread.run_sync(init_db)
+            init_db()
         except Exception as exc:
             logger.warning(
                 "Postgres is unavailable at startup; DB-backed endpoints may fail until DB is restored (%s: %s)",
@@ -111,14 +151,49 @@ async def startup():
                 exc,
             )
 
-    await anyio.to_thread.run_sync(store.start_cache)
+    cache_started = store.start_cache()
+    if not cache_started:
+        logger.warning("Online cache startup is degraded; readiness endpoint may report not ready")
 
 
-@app.on_event("shutdown")
 async def shutdown():
     await _drain_background_tasks()
-    await anyio.to_thread.run_sync(store.stop_cache)
+    store.stop_cache()
     close_pool()
+
+
+@app.middleware("http")
+async def bind_request_context(request: Request, call_next):
+    incoming_request_id = _normalized_header_id(request.headers.get("x-request-id"))
+    incoming_correlation_id = _normalized_header_id(request.headers.get("x-correlation-id"))
+    request_id = incoming_request_id or uuid.uuid4().hex
+    correlation_id = incoming_correlation_id or request_id
+    request.state.request_id = request_id
+    request.state.correlation_id = correlation_id
+
+    started_at = time.perf_counter()
+    with log_context(request_id=request_id, correlation_id=correlation_id, component="api"):
+        try:
+            response = await call_next(request)
+        except Exception:
+            logger.exception(
+                "Request failed method=%s path=%s",
+                request.method,
+                request.url.path,
+            )
+            raise
+
+    latency_ms = (time.perf_counter() - started_at) * 1000.0
+    response.headers["X-Request-ID"] = request_id
+    response.headers["X-Correlation-ID"] = correlation_id
+    logger.info(
+        "http_request method=%s path=%s status_code=%s latency_ms=%.3f",
+        request.method,
+        request.url.path,
+        response.status_code,
+        latency_ms,
+    )
+    return response
 
 
 @app.middleware("http")
@@ -126,19 +201,29 @@ async def collect_reco_metrics(request: Request, call_next):
     if request.url.path != "/reco":
         return await call_next(request)
 
+    request_id = sanitize_identifier(
+        getattr(request.state, "request_id", None),
+        fallback=uuid.uuid4().hex,
+    )
+    correlation_id = sanitize_identifier(
+        getattr(request.state, "correlation_id", None),
+        fallback=request_id,
+    )
+
     started_at = time.perf_counter()
     status_code = 500
-    try:
-        response = await call_next(request)
-        status_code = response.status_code
-        return response
-    except Exception:
-        status_code = 500
-        raise
-    finally:
-        latency_ms = (time.perf_counter() - started_at) * 1000.0
-        reco_metrics.record(latency_ms=latency_ms, status_code=status_code)
-        observe_reco_request(latency_ms=latency_ms, status_code=status_code)
+    with log_context(request_id=request_id, correlation_id=correlation_id, component="api"):
+        try:
+            response = await call_next(request)
+            status_code = response.status_code
+            return response
+        except Exception:
+            status_code = 500
+            raise
+        finally:
+            latency_ms = (time.perf_counter() - started_at) * 1000.0
+            reco_metrics.record(latency_ms=latency_ms, status_code=status_code)
+            observe_reco_request(latency_ms=latency_ms, status_code=status_code)
 
 
 @app.post("/event")
@@ -173,9 +258,19 @@ def prometheus_metrics():
 
 @app.get("/healthz")
 def healthcheck():
-    outbox_snapshot = _safe_outbox_snapshot() if ping_db() else None
+    db_ok = ping_db()
+    cache_ok = store.cache_ready()
+    set_api_check_status(scope="healthz", check="db", ok=db_ok)
+    set_api_check_status(scope="healthz", check="online_cache", ok=cache_ok)
+    outbox_snapshot = _safe_outbox_snapshot() if db_ok else None
+    if outbox_snapshot and isinstance(outbox_snapshot, dict) and "pending" in outbox_snapshot:
+        set_outbox_backlog_metrics(outbox_snapshot)
     return {
         "status": "ok",
+        "checks": {
+            "db": db_ok,
+            "online_cache": cache_ok,
+        },
         "event_backbone": {"mode": EVENT_BACKBONE_MODE, "outbox": outbox_snapshot},
         "online_cache": store.cache_snapshot(),
     }
@@ -185,10 +280,14 @@ def healthcheck():
 async def readiness_check():
     db_ready = ping_db()
     if not store.cache_ready():
-        await anyio.to_thread.run_sync(store.start_cache)
+        store.start_cache()
     cache_ready = store.cache_ready()
+    set_api_check_status(scope="readyz", check="db", ok=db_ready)
+    set_api_check_status(scope="readyz", check="online_cache", ok=cache_ready)
     ready = db_ready and cache_ready
     outbox_snapshot = _safe_outbox_snapshot() if db_ready else None
+    if outbox_snapshot and isinstance(outbox_snapshot, dict) and "pending" in outbox_snapshot:
+        set_outbox_backlog_metrics(outbox_snapshot)
 
     payload = {
         "ready": ready,
@@ -253,11 +352,11 @@ def rank_candidates(
 
 
 async def _persist_impression(evt: ImpressionEvent) -> int:
-    return await anyio.to_thread.run_sync(persist_impression_event, evt)
+    return persist_impression_event(evt)
 
 
 async def _persist_watch(evt: WatchEvent) -> bool:
-    return await anyio.to_thread.run_sync(persist_watch_event, evt)
+    return persist_watch_event(evt)
 
 
 def _with_server_received_ts(event: ImpressionEvent | WatchEvent) -> ImpressionEvent | WatchEvent:
@@ -286,9 +385,12 @@ def _track_background_task(task: asyncio.Task) -> None:
     task.add_done_callback(_cleanup)
 
 
-def _schedule_background(coro) -> None:
+def _schedule_background(coro) -> bool:
+    if len(_background_tasks) >= RECO_MAX_BACKGROUND_TASKS:
+        return False
     task = asyncio.create_task(coro)
     _track_background_task(task)
+    return True
 
 
 async def _drain_background_tasks() -> None:
@@ -362,24 +464,28 @@ async def log_watch(evt: WatchEvent):
 
 @app.get("/reco", response_model=RecoResponse)
 async def get_reco(
+    request: Request,
     user_id: str,
     session_id: str,
     k: int = Query(default=20, ge=1, le=200),
     x_autolog_impressions: bool = True,
     user_agent: Optional[str] = Header(default=None, alias="User-Agent"),
 ):
-    req_id = new_request_id()
+    req_id = sanitize_identifier(
+        getattr(request.state, "request_id", None),
+        fallback=new_request_id(),
+    )
+    safe_user_agent = user_agent[:512] if user_agent else None
 
     retrieval_started = time.perf_counter()
-    candidates, user_history = await anyio.to_thread.run_sync(
-        retrieve_candidates_and_history,
+    candidates, user_history = retrieve_candidates_and_history(
         user_id,
         max(k * 20, 200),
     )
     observe_reco_stage_latency("retrieval", (time.perf_counter() - retrieval_started) * 1000.0)
 
     ranking_started = time.perf_counter()
-    items = await anyio.to_thread.run_sync(rank_candidates, user_id, candidates, k, user_history)
+    items = rank_candidates(user_id, candidates, k, user_history)
     observe_reco_stage_latency("ranking", (time.perf_counter() - ranking_started) * 1000.0)
 
     if x_autolog_impressions and items:
@@ -389,12 +495,22 @@ async def get_reco(
             request_id=req_id,
             ts_ms=now_ms(),
             items=[ImpressionItem(item_id=item, position=pos) for pos, item in enumerate(items)],
-            context=Context(user_agent=user_agent),
+            context=Context(user_agent=safe_user_agent),
         )
         payload = _with_server_received_ts(imp_evt)
         if RECO_ASYNC_IMPRESSION_LOGGING:
-            _schedule_background(_persist_impression_to_outbox(payload, req_id, user_id))
-            observe_reco_stage_latency("impression_schedule", 0.0)
+            scheduled = _schedule_background(_persist_impression_to_outbox(payload, req_id, user_id))
+            if scheduled:
+                observe_reco_stage_latency("impression_schedule", 0.0)
+            elif RECO_BACKGROUND_BACKPRESSURE_MODE == "drop":
+                observe_reco_stage_latency("impression_drop", 0.0)
+                logger.warning(
+                    "Dropping async impression logging due to background queue saturation request_id=%s",
+                    req_id,
+                )
+            else:
+                observe_reco_stage_latency("impression_backpressure_sync", 0.0)
+                await _persist_impression_to_outbox(payload, req_id, user_id)
         else:
             await _persist_impression_to_outbox(payload, req_id, user_id)
     elif x_autolog_impressions:

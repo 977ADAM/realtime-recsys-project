@@ -144,6 +144,24 @@ CONSUMER_PARTITION_LAG = Gauge(
     labelnames=("topic", "partition"),
 )
 
+API_CHECK_STATUS = Gauge(
+    "reco_api_check_status",
+    "Status of API health/readiness checks by scope.",
+    labelnames=("scope", "check"),
+)
+
+OUTBOX_RELAY_ERRORS_TOTAL = Counter(
+    "reco_outbox_relay_errors_total",
+    "Outbox relay loop-level errors by stage.",
+    labelnames=("stage",),
+)
+
+FEATURE_CONSUMER_ERRORS_TOTAL = Counter(
+    "reco_feature_consumer_errors_total",
+    "Feature consumer loop-level errors by stage.",
+    labelnames=("stage",),
+)
+
 
 def observe_reco_request(latency_ms: float, status_code: int) -> None:
     status_family = f"{max(status_code, 0) // 100}xx"
@@ -187,6 +205,18 @@ def observe_consumer_event_lag(topic: str, latency_ms: float) -> None:
 
 def set_consumer_partition_lag(topic: str, partition: int, lag: int) -> None:
     CONSUMER_PARTITION_LAG.labels(topic=topic, partition=str(int(partition))).set(float(max(int(lag), 0)))
+
+
+def set_api_check_status(scope: str, check: str, ok: bool) -> None:
+    API_CHECK_STATUS.labels(scope=scope, check=check).set(1.0 if ok else 0.0)
+
+
+def observe_outbox_relay_error(stage: str) -> None:
+    OUTBOX_RELAY_ERRORS_TOTAL.labels(stage=stage).inc()
+
+
+def observe_feature_consumer_error(stage: str) -> None:
+    FEATURE_CONSUMER_ERRORS_TOTAL.labels(stage=stage).inc()
 
 
 def prometheus_payload() -> Optional[bytes]:

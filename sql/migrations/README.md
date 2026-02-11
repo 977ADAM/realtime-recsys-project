@@ -7,3 +7,7 @@ Conventions:
 
 Applied migrations are tracked in the Postgres table `schema_migrations`
 with a stored SHA-256 checksum for drift detection.
+
+Validation helpers:
+- local-only check: `python src/check_migrations.py --skip-db-check`
+- local + live DB checksum/drift check: `python src/check_migrations.py --database-url ...`

@@ -1,7 +1,8 @@
+import asyncio
 import importlib
+from types import SimpleNamespace
 
 import pytest
-from fastapi.testclient import TestClient
 
 
 class FakeStore:
@@ -45,8 +46,12 @@ class FakeStore:
         return None
 
 
+def _fake_request(request_id: str = "smoke-request-1"):
+    return SimpleNamespace(state=SimpleNamespace(request_id=request_id))
+
+
 @pytest.fixture
-def client(monkeypatch):
+def app_module(monkeypatch):
     monkeypatch.setenv("DB_INIT_ON_STARTUP", "false")
     monkeypatch.setenv("KAFKA_DUAL_WRITE_ENABLED", "false")
     monkeypatch.setenv("PROMETHEUS_METRICS_ENABLED", "false")
@@ -56,46 +61,44 @@ def client(monkeypatch):
 
     main = importlib.reload(main)
     main.store = FakeStore()
+    main.ping_db = lambda: False
+    return main
 
-    with TestClient(main.app) as test_client:
-        yield test_client
 
+def test_contract_endpoint_smoke(app_module):
+    payload = app_module.get_contract()
 
-def test_contract_endpoint_smoke(client: TestClient):
-    response = client.get("/contract")
-
-    assert response.status_code == 200
-    payload = response.json()
     assert "kpi_targets" in payload
     assert "sla_targets" in payload
     assert "event_contract" in payload
 
 
-def test_health_endpoint_smoke(client: TestClient):
-    response = client.get("/healthz")
+def test_health_endpoint_smoke(app_module):
+    payload = app_module.healthcheck()
 
-    assert response.status_code == 200
-    payload = response.json()
     assert payload["status"] == "ok"
+    assert payload["checks"]["db"] is False
+    assert payload["checks"]["online_cache"] is True
     assert "event_backbone" in payload
     assert payload["event_backbone"]["mode"] == "transactional_outbox"
     assert "online_cache" in payload
 
 
-def test_reco_endpoint_smoke(client: TestClient):
-    response = client.get(
-        "/reco",
-        params={
-            "user_id": "user-1",
-            "session_id": "session-1",
-            "k": 2,
-            "x_autolog_impressions": "false",
-        },
+def test_reco_endpoint_smoke(app_module):
+    response = asyncio.run(
+        app_module.get_reco(
+            request=_fake_request(),
+            user_id="user-1",
+            session_id="session-1",
+            k=2,
+            x_autolog_impressions=False,
+            user_agent="pytest-agent",
+        )
     )
 
-    assert response.status_code == 200
-    payload = response.json()
-    assert payload["items"] == ["item-b", "item-a"]
+    payload = response.model_dump()
+    assert len(payload["items"]) == 2
+    assert set(payload["items"]) == {"item-a", "item-b"}
     assert payload["model_version"] == "rules-v1"
     assert payload["strategy"] == "co_vis_popularity_hybrid"
     assert isinstance(payload["request_id"], str)

@@ -1,13 +1,112 @@
+import contextlib
+import contextvars
+import datetime as dt
+import json
+import logging
 import math
+import os
 from collections import deque
 from threading import Lock
 
 if __package__:
     from .config import SLA_TARGETS
-    from .runtime_utils import now_ms, positive_int_env
+    from .runtime_utils import now_ms, positive_int_env, sanitize_identifier
 else:  # pragma: no cover - fallback for direct script execution
     from config import SLA_TARGETS
-    from runtime_utils import now_ms, positive_int_env
+    from runtime_utils import now_ms, positive_int_env, sanitize_identifier
+
+
+_request_id_ctx: contextvars.ContextVar[str] = contextvars.ContextVar("request_id", default="-")
+_correlation_id_ctx: contextvars.ContextVar[str] = contextvars.ContextVar("correlation_id", default="-")
+_component_ctx: contextvars.ContextVar[str] = contextvars.ContextVar("component", default="recsys")
+_logging_configured = False
+
+
+class _RequestContextFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.request_id = _request_id_ctx.get()
+        record.correlation_id = _correlation_id_ctx.get()
+        record.component = _component_ctx.get()
+        return True
+
+
+class _JsonFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            "ts": dt.datetime.utcnow().isoformat(timespec="milliseconds") + "Z",
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+            "component": getattr(record, "component", _component_ctx.get()),
+            "request_id": getattr(record, "request_id", _request_id_ctx.get()),
+            "correlation_id": getattr(record, "correlation_id", _correlation_id_ctx.get()),
+        }
+        if record.exc_info:
+            payload["exc_info"] = self.formatException(record.exc_info)
+        return json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
+
+
+def configure_logging(component: str = "recsys") -> None:
+    global _logging_configured
+
+    root = logging.getLogger()
+    level = os.getenv("LOG_LEVEL", "INFO").upper()
+    text_format = (
+        "%(asctime)s %(levelname)s %(name)s [component=%(component)s request_id=%(request_id)s "
+        "correlation_id=%(correlation_id)s] %(message)s"
+    )
+
+    if not _logging_configured:
+        handler = logging.StreamHandler()
+        if os.getenv("LOG_FORMAT", "json").strip().lower() == "json":
+            handler.setFormatter(_JsonFormatter())
+        else:
+            handler.setFormatter(logging.Formatter(text_format))
+        root.handlers = [handler]
+        _logging_configured = True
+
+    for handler in root.handlers:
+        if not any(isinstance(log_filter, _RequestContextFilter) for log_filter in handler.filters):
+            handler.addFilter(_RequestContextFilter())
+
+    root.setLevel(getattr(logging, level, logging.INFO))
+    _component_ctx.set(sanitize_identifier(component, fallback="recsys"))
+
+
+def set_log_context(*, request_id: str, correlation_id: str, component: str | None = None) -> None:
+    _request_id_ctx.set(sanitize_identifier(request_id, fallback="-"))
+    _correlation_id_ctx.set(sanitize_identifier(correlation_id, fallback="-"))
+    if component:
+        _component_ctx.set(sanitize_identifier(component, fallback="recsys"))
+
+
+@contextlib.contextmanager
+def log_context(
+    *,
+    request_id: str,
+    correlation_id: str,
+    component: str | None = None,
+):
+    request_token = _request_id_ctx.set(sanitize_identifier(request_id, fallback="-"))
+    correlation_token = _correlation_id_ctx.set(sanitize_identifier(correlation_id, fallback="-"))
+    component_token = None
+    if component is not None:
+        component_token = _component_ctx.set(sanitize_identifier(component, fallback="recsys"))
+    try:
+        yield
+    finally:
+        _request_id_ctx.reset(request_token)
+        _correlation_id_ctx.reset(correlation_token)
+        if component_token is not None:
+            _component_ctx.reset(component_token)
+
+
+def current_log_context() -> dict[str, str]:
+    return {
+        "request_id": _request_id_ctx.get(),
+        "correlation_id": _correlation_id_ctx.get(),
+        "component": _component_ctx.get(),
+    }
 
 
 def _percentile(values, q: float):

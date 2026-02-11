@@ -1,6 +1,7 @@
 import os
 import hashlib
 import json
+import logging
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Optional, Tuple
@@ -12,11 +13,11 @@ from psycopg.types.json import Jsonb
 
 if __package__:
     from .repositories import EventLogRepository, FeatureRepository
-    from .runtime_utils import normalize_unix_ts_seconds, positive_int_env
+    from .runtime_utils import normalize_unix_ts_seconds, positive_float_env, positive_int_env
     from .schemas import ImpressionEvent, WatchEvent
 else:  # pragma: no cover - fallback for direct script execution
     from repositories import EventLogRepository, FeatureRepository
-    from runtime_utils import normalize_unix_ts_seconds, positive_int_env
+    from runtime_utils import normalize_unix_ts_seconds, positive_float_env, positive_int_env
     from schemas import ImpressionEvent, WatchEvent
 
 try:
@@ -29,11 +30,17 @@ MIGRATIONS_DIR = Path(__file__).resolve().parents[1] / "sql" / "migrations"
 MIGRATIONS_TABLE = "schema_migrations"
 
 _pool = None
+logger = logging.getLogger(__name__)
 
 
 STREAM_FEATURE_HISTORY_SIZE = positive_int_env("STREAM_FEATURE_HISTORY_SIZE", 20)
 feature_repository = FeatureRepository()
 event_log_repository = EventLogRepository()
+
+DB_CONNECT_TIMEOUT_SEC = positive_float_env("DB_CONNECT_TIMEOUT_SEC", 2.0)
+DB_POOL_OPEN_TIMEOUT_SEC = positive_float_env("DB_POOL_OPEN_TIMEOUT_SEC", 5.0)
+DB_STATEMENT_TIMEOUT_MS = positive_int_env("DB_STATEMENT_TIMEOUT_MS", 5000)
+DB_LOCK_TIMEOUT_MS = positive_int_env("DB_LOCK_TIMEOUT_MS", 1000)
 
 OUTBOX_MAX_ATTEMPTS = positive_int_env("OUTBOX_MAX_ATTEMPTS", 25)
 OUTBOX_BASE_RETRY_SEC = positive_int_env("OUTBOX_RELAY_BASE_RETRY_SEC", 1)
@@ -118,27 +125,48 @@ def _get_pool():
     if ConnectionPool is None:
         return None
     if _pool is None:
-        min_size = int(os.getenv("DB_POOL_MIN_SIZE", "1"))
-        max_size = int(os.getenv("DB_POOL_MAX_SIZE", "10"))
+        min_size = positive_int_env("DB_POOL_MIN_SIZE", 1)
+        max_size = max(positive_int_env("DB_POOL_MAX_SIZE", 10), min_size)
         _pool = ConnectionPool(
             conninfo=_database_url(),
             min_size=min_size,
             max_size=max_size,
-            kwargs={"row_factory": dict_row},
+            kwargs=_connection_kwargs(),
+            timeout=DB_POOL_OPEN_TIMEOUT_SEC,
             open=True,
         )
     return _pool
+
+
+def _connection_kwargs() -> dict[str, Any]:
+    kwargs: dict[str, Any] = {
+        "row_factory": dict_row,
+        "connect_timeout": max(int(DB_CONNECT_TIMEOUT_SEC), 1),
+    }
+
+    options: list[str] = []
+    if DB_STATEMENT_TIMEOUT_MS > 0:
+        options.append(f"-c statement_timeout={int(DB_STATEMENT_TIMEOUT_MS)}")
+    if DB_LOCK_TIMEOUT_MS > 0:
+        options.append(f"-c lock_timeout={int(DB_LOCK_TIMEOUT_MS)}")
+    if options:
+        kwargs["options"] = " ".join(options)
+    return kwargs
 
 
 @contextmanager
 def get_conn():
     pool = _get_pool()
     if pool is not None:
-        with pool.connection() as conn:
-            yield conn
+        try:
+            with pool.connection() as conn:
+                yield conn
+        except Exception:
+            logger.exception("Database pool connection acquisition failed")
+            raise
         return
 
-    conn = psycopg.connect(_database_url(), row_factory=dict_row)
+    conn = psycopg.connect(_database_url(), **_connection_kwargs())
     try:
         yield conn
     finally:
@@ -234,13 +262,18 @@ def init_db(migrations_dir: Path = MIGRATIONS_DIR, schema_path: Path = SCHEMA_PA
 def close_pool():
     global _pool
     if _pool is not None:
-        _pool.close()
+        try:
+            _pool.close(timeout=1.0)
+        except TypeError:
+            _pool.close()
+        except Exception:
+            logger.exception("Failed to close database pool cleanly")
         _pool = None
 
 
 def ping_db() -> bool:
     try:
-        with get_conn() as conn:
+        with psycopg.connect(_database_url(), **_connection_kwargs()) as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT 1 AS ok")
                 row = cur.fetchone()

@@ -5,28 +5,51 @@ services:
       dockerfile: Dockerfile
     container_name: recsys-api
     restart: unless-stopped
+    init: true
+    stop_grace_period: 20s
     depends_on:
       postgres:
         condition: service_healthy
       kafka:
-        condition: service_started
+        condition: service_healthy
       redis:
-        condition: service_started
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
     ports:
       - "8080:8080"
     environment:
-      DATABASE_URL: ${DATABASE_URL:-postgresql://recsys:recsys_change_me@postgres:5432/recsys}
+      APP_ENV: ${APP_ENV:-dev}
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL must be set}
       DB_INIT_ON_STARTUP: ${DB_INIT_ON_STARTUP:-true}
+      DB_POOL_MIN_SIZE: ${DB_POOL_MIN_SIZE:-1}
+      DB_POOL_MAX_SIZE: ${DB_POOL_MAX_SIZE:-10}
+      DB_CONNECT_TIMEOUT_SEC: ${DB_CONNECT_TIMEOUT_SEC:-2}
+      DB_POOL_OPEN_TIMEOUT_SEC: ${DB_POOL_OPEN_TIMEOUT_SEC:-5}
+      DB_STATEMENT_TIMEOUT_MS: ${DB_STATEMENT_TIMEOUT_MS:-5000}
+      DB_LOCK_TIMEOUT_MS: ${DB_LOCK_TIMEOUT_MS:-1000}
       WATCH_FEATURE_UPDATE_MODE: ${WATCH_FEATURE_UPDATE_MODE:-async_consumer}
       KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
       KAFKA_TOPIC_IMPRESSIONS: ${KAFKA_TOPIC_IMPRESSIONS:-recsys.impressions.v1}
       KAFKA_TOPIC_WATCHES: ${KAFKA_TOPIC_WATCHES:-recsys.watches.v1}
-      PROMETHEUS_METRICS_ENABLED: ${PROMETHEUS_METRICS_ENABLED:-false}
+      PROMETHEUS_METRICS_ENABLED: ${PROMETHEUS_METRICS_ENABLED:-true}
+      METRICS_HOST: ${METRICS_HOST:-0.0.0.0}
+      METRICS_PORT: ${METRICS_PORT:-9108}
       RECO_ASYNC_IMPRESSION_LOGGING: ${RECO_ASYNC_IMPRESSION_LOGGING:-true}
+      RECO_MAX_BACKGROUND_TASKS: ${RECO_MAX_BACKGROUND_TASKS:-1000}
+      RECO_BACKGROUND_BACKPRESSURE_MODE: ${RECO_BACKGROUND_BACKPRESSURE_MODE:-sync}
       RECO_BACKGROUND_SHUTDOWN_TIMEOUT_SEC: ${RECO_BACKGROUND_SHUTDOWN_TIMEOUT_SEC:-5}
       ONLINE_CACHE_ENABLED: ${ONLINE_CACHE_ENABLED:-true}
       ONLINE_CACHE_BACKEND: ${ONLINE_CACHE_BACKEND:-redis}
       ONLINE_CACHE_REDIS_URL: ${ONLINE_CACHE_REDIS_URL:-redis://redis:6379/0}
+      ONLINE_CACHE_REDIS_TIMEOUT_SEC: ${ONLINE_CACHE_REDIS_TIMEOUT_SEC:-1}
       ONLINE_CACHE_HISTORY_TTL_SEC: ${ONLINE_CACHE_HISTORY_TTL_SEC:-20}
       ONLINE_CACHE_RELATED_TTL_SEC: ${ONLINE_CACHE_RELATED_TTL_SEC:-30}
       ONLINE_CACHE_POPULARITY_TTL_SEC: ${ONLINE_CACHE_POPULARITY_TTL_SEC:-5}
@@ -35,6 +58,23 @@ services:
       - sh
       - -c
       - uvicorn app.main:app --host 0.0.0.0 --port 8080 --workers ${UVICORN_WORKERS:-2}
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import sys, urllib.request
+          urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=2)
+          sys.exit(0)
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+    logging:
+      options:
+        max-size: 10m
+        max-file: "3"
 
   outbox-relay:
     build:
@@ -42,13 +82,29 @@ services:
       dockerfile: Dockerfile
     container_name: recsys-outbox-relay
     restart: unless-stopped
+    init: true
+    stop_grace_period: 20s
     depends_on:
       postgres:
         condition: service_healthy
       kafka:
-        condition: service_started
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
     environment:
-      DATABASE_URL: ${DATABASE_URL:-postgresql://recsys:recsys_change_me@postgres:5432/recsys}
+      APP_ENV: ${APP_ENV:-dev}
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL must be set}
+      DB_CONNECT_TIMEOUT_SEC: ${DB_CONNECT_TIMEOUT_SEC:-2}
+      DB_POOL_OPEN_TIMEOUT_SEC: ${DB_POOL_OPEN_TIMEOUT_SEC:-5}
+      DB_STATEMENT_TIMEOUT_MS: ${DB_STATEMENT_TIMEOUT_MS:-5000}
+      DB_LOCK_TIMEOUT_MS: ${DB_LOCK_TIMEOUT_MS:-1000}
       KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
       KAFKA_TOPIC_IMPRESSIONS: ${KAFKA_TOPIC_IMPRESSIONS:-recsys.impressions.v1}
       KAFKA_TOPIC_WATCHES: ${KAFKA_TOPIC_WATCHES:-recsys.watches.v1}
@@ -59,7 +115,11 @@ services:
       OUTBOX_RELAY_LEASE_SEC: ${OUTBOX_RELAY_LEASE_SEC:-30}
       OUTBOX_RELAY_BASE_RETRY_SEC: ${OUTBOX_RELAY_BASE_RETRY_SEC:-1}
       OUTBOX_RELAY_MAX_RETRY_SEC: ${OUTBOX_RELAY_MAX_RETRY_SEC:-60}
-      PROMETHEUS_METRICS_ENABLED: ${PROMETHEUS_METRICS_ENABLED:-false}
+      OUTBOX_RELAY_PUBLISH_TIMEOUT_SEC: ${OUTBOX_RELAY_PUBLISH_TIMEOUT_SEC:-10}
+      OUTBOX_RELAY_STARTUP_MAX_RETRIES: ${OUTBOX_RELAY_STARTUP_MAX_RETRIES:-0}
+      OUTBOX_RELAY_STARTUP_BACKOFF_SEC: ${OUTBOX_RELAY_STARTUP_BACKOFF_SEC:-2}
+      OUTBOX_RELAY_SHUTDOWN_TIMEOUT_SEC: ${OUTBOX_RELAY_SHUTDOWN_TIMEOUT_SEC:-15}
+      PROMETHEUS_METRICS_ENABLED: ${PROMETHEUS_METRICS_ENABLED:-true}
       METRICS_HOST: ${METRICS_HOST:-0.0.0.0}
       METRICS_PORT: ${OUTBOX_RELAY_METRICS_PORT:-9109}
     command:
@@ -67,6 +127,23 @@ services:
       - src/outbox_relay.py
     ports:
       - "${OUTBOX_RELAY_METRICS_PORT:-9109}:${OUTBOX_RELAY_METRICS_PORT:-9109}"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import sys, urllib.request
+          urllib.request.urlopen('http://127.0.0.1:${OUTBOX_RELAY_METRICS_PORT:-9109}/metrics', timeout=2)
+          sys.exit(0)
+      interval: 20s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+    logging:
+      options:
+        max-size: 10m
+        max-file: "3"
 
   feature-consumer:
     build:
@@ -74,15 +151,31 @@ services:
       dockerfile: Dockerfile
     container_name: recsys-feature-consumer
     restart: unless-stopped
+    init: true
+    stop_grace_period: 20s
     depends_on:
       postgres:
         condition: service_healthy
       kafka:
-        condition: service_started
+        condition: service_healthy
       redis:
-        condition: service_started
+        condition: service_healthy
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
     environment:
-      DATABASE_URL: ${DATABASE_URL:-postgresql://recsys:recsys_change_me@postgres:5432/recsys}
+      APP_ENV: ${APP_ENV:-dev}
+      LOG_FORMAT: ${LOG_FORMAT:-json}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL must be set}
+      DB_CONNECT_TIMEOUT_SEC: ${DB_CONNECT_TIMEOUT_SEC:-2}
+      DB_POOL_OPEN_TIMEOUT_SEC: ${DB_POOL_OPEN_TIMEOUT_SEC:-5}
+      DB_STATEMENT_TIMEOUT_MS: ${DB_STATEMENT_TIMEOUT_MS:-5000}
+      DB_LOCK_TIMEOUT_MS: ${DB_LOCK_TIMEOUT_MS:-1000}
       KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS:-kafka:9092}
       KAFKA_TOPIC_IMPRESSIONS: ${KAFKA_TOPIC_IMPRESSIONS:-recsys.impressions.v1}
       KAFKA_TOPIC_WATCHES: ${KAFKA_TOPIC_WATCHES:-recsys.watches.v1}
@@ -90,12 +183,15 @@ services:
       FEATURE_CONSUMER_CLIENT_ID: ${FEATURE_CONSUMER_CLIENT_ID:-recsys-feature-consumer}
       FEATURE_CONSUMER_POLL_TIMEOUT_MS: ${FEATURE_CONSUMER_POLL_TIMEOUT_MS:-1000}
       FEATURE_CONSUMER_MAX_POLL_RECORDS: ${FEATURE_CONSUMER_MAX_POLL_RECORDS:-500}
+      FEATURE_CONSUMER_STARTUP_MAX_RETRIES: ${FEATURE_CONSUMER_STARTUP_MAX_RETRIES:-0}
+      FEATURE_CONSUMER_STARTUP_BACKOFF_SEC: ${FEATURE_CONSUMER_STARTUP_BACKOFF_SEC:-2}
+      FEATURE_CONSUMER_SHUTDOWN_TIMEOUT_SEC: ${FEATURE_CONSUMER_SHUTDOWN_TIMEOUT_SEC:-20}
       STREAM_FEATURE_HISTORY_SIZE: ${STREAM_FEATURE_HISTORY_SIZE:-20}
       ONLINE_CACHE_ENABLED: ${ONLINE_CACHE_ENABLED:-true}
       ONLINE_CACHE_BACKEND: ${ONLINE_CACHE_BACKEND:-redis}
       ONLINE_CACHE_REDIS_URL: ${ONLINE_CACHE_REDIS_URL:-redis://redis:6379/0}
       ONLINE_CACHE_REDIS_TIMEOUT_SEC: ${ONLINE_CACHE_REDIS_TIMEOUT_SEC:-1}
-      PROMETHEUS_METRICS_ENABLED: ${PROMETHEUS_METRICS_ENABLED:-false}
+      PROMETHEUS_METRICS_ENABLED: ${PROMETHEUS_METRICS_ENABLED:-true}
       METRICS_HOST: ${METRICS_HOST:-0.0.0.0}
       METRICS_PORT: ${FEATURE_CONSUMER_METRICS_PORT:-9110}
     command:
@@ -103,9 +199,26 @@ services:
       - src/feature_consumer.py
     ports:
       - "${FEATURE_CONSUMER_METRICS_PORT:-9110}:${FEATURE_CONSUMER_METRICS_PORT:-9110}"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import sys, urllib.request
+          urllib.request.urlopen('http://127.0.0.1:${FEATURE_CONSUMER_METRICS_PORT:-9110}/metrics', timeout=2)
+          sys.exit(0)
+      interval: 20s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+    logging:
+      options:
+        max-size: 10m
+        max-file: "3"
 
   postgres:
-    image: postgres:16-alpine
+    image: postgres:16.4-alpine
     container_name: recsys-postgres
     restart: unless-stopped
     ports:
@@ -113,7 +226,7 @@ services:
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-recsys}
       POSTGRES_USER: ${POSTGRES_USER:-recsys}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-recsys_change_me}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -122,35 +235,61 @@ services:
         - pg_isready -U ${POSTGRES_USER:-recsys} -d ${POSTGRES_DB:-recsys}
       interval: 10s
       timeout: 5s
-      retries: 5
+      retries: 8
 
   kafka:
-    image: apache/kafka:latest
+    image: redpandadata/redpanda:v24.3.6
     container_name: recsys-kafka
     restart: unless-stopped
+    command:
+      - redpanda
+      - start
+      - --overprovisioned
+      - --smp
+      - "1"
+      - --memory
+      - 1G
+      - --reserve-memory
+      - 0M
+      - --check=false
+      - --node-id
+      - "1"
+      - --kafka-addr
+      - PLAINTEXT://0.0.0.0:9092,OUTSIDE://0.0.0.0:29092
+      - --advertise-kafka-addr
+      - PLAINTEXT://kafka:9092,OUTSIDE://localhost:29092
     ports:
       - "9092:9092"
       - "29092:29092"
-    environment:
-      KAFKA_NODE_ID: 1
-      KAFKA_PROCESS_ROLES: broker,controller
-      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,PLAINTEXT_HOST://0.0.0.0:29092,CONTROLLER://0.0.0.0:9093
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT,CONTROLLER:PLAINTEXT
-      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
-      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
-      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
-      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
-      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
-      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - rpk cluster info --brokers=localhost:9092 >/dev/null 2>&1
+      interval: 15s
+      timeout: 10s
+      retries: 8
+      start_period: 20s
 
   redis:
-    image: redis:7-alpine
+    image: redis:7.4-alpine
     container_name: recsys-redis
     restart: unless-stopped
     ports:
       - "6379:6379"
+    command:
+      - redis-server
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+    healthcheck:
+      test:
+        - CMD
+        - redis-cli
+        - ping
+      interval: 10s
+      timeout: 3s
+      retries: 8
 
 volumes:
   postgres_data:
