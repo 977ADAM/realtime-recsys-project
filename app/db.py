@@ -72,6 +72,30 @@ _INSERT_CONSUMED_FEATURE_EVENT_SQL = """
     RETURNING 1
 """
 
+_UPSERT_FEATURE_CONSUMER_DLQ_SQL = """
+    INSERT INTO feature_consumer_dlq (
+        source_topic,
+        source_partition,
+        source_offset,
+        kafka_key,
+        payload,
+        error_text,
+        retry_count
+    )
+    VALUES (%s, %s, %s, %s, %s, %s, %s)
+    ON CONFLICT (source_topic, source_partition, source_offset)
+    DO UPDATE SET
+        kafka_key = EXCLUDED.kafka_key,
+        payload = EXCLUDED.payload,
+        error_text = EXCLUDED.error_text,
+        retry_count = GREATEST(feature_consumer_dlq.retry_count, EXCLUDED.retry_count),
+        last_failed_at = now(),
+        updated_at = now(),
+        status = 'pending',
+        last_replay_error = NULL
+    RETURNING id
+"""
+
 _CLAIM_OUTBOX_EVENTS_SQL = """
     WITH candidates AS (
         SELECT id
@@ -331,6 +355,34 @@ def _enqueue_outbox_event(
     return cur.fetchone() is not None
 
 
+def _persist_impression_event_with_cursor(cur, event: ImpressionEvent) -> int:
+    context_jsonb = _context_to_jsonb(event.context)
+    inserted_rows = event_log_repository.insert_impression_event(cur, event, context_jsonb)
+    if inserted_rows > 0:
+        _enqueue_outbox_event(
+            cur,
+            event_id=event.event_id,
+            event_type="impression",
+            kafka_key=event.user_id,
+            payload=_event_payload(event),
+        )
+    return inserted_rows
+
+
+def _persist_watch_event_with_cursor(cur, event: WatchEvent) -> bool:
+    context_jsonb = _context_to_jsonb(event.context)
+    inserted_watch = event_log_repository.insert_watch_event(cur, event, context_jsonb)
+    if inserted_watch:
+        _enqueue_outbox_event(
+            cur,
+            event_id=event.event_id,
+            event_type="watch",
+            kafka_key=event.user_id,
+            payload=_event_payload(event),
+        )
+    return inserted_watch
+
+
 def compute_outbox_retry_delay_sec(
     attempt_count: int,
     base_retry_sec: int = OUTBOX_BASE_RETRY_SEC,
@@ -344,35 +396,31 @@ def compute_outbox_retry_delay_sec(
 
 
 def persist_impression_event(event: ImpressionEvent) -> int:
-    context_jsonb = _context_to_jsonb(event.context)
     with transaction() as conn:
         with conn.cursor() as cur:
-            inserted_rows = event_log_repository.insert_impression_event(cur, event, context_jsonb)
-            if inserted_rows > 0:
-                _enqueue_outbox_event(
-                    cur,
-                    event_id=event.event_id,
-                    event_type="impression",
-                    kafka_key=event.user_id,
-                    payload=_event_payload(event),
-                )
-            return inserted_rows
+            return _persist_impression_event_with_cursor(cur, event)
 
 
 def persist_watch_event(event: WatchEvent) -> bool:
-    context_jsonb = _context_to_jsonb(event.context)
     with transaction() as conn:
         with conn.cursor() as cur:
-            inserted_watch = event_log_repository.insert_watch_event(cur, event, context_jsonb)
-            if inserted_watch:
-                _enqueue_outbox_event(
-                    cur,
-                    event_id=event.event_id,
-                    event_type="watch",
-                    kafka_key=event.user_id,
-                    payload=_event_payload(event),
-                )
-            return inserted_watch
+            return _persist_watch_event_with_cursor(cur, event)
+
+
+def persist_event_batch(events: list[ImpressionEvent | WatchEvent]) -> int:
+    inserted_events = 0
+    with transaction() as conn:
+        with conn.cursor() as cur:
+            for event in events:
+                if isinstance(event, ImpressionEvent):
+                    inserted_impression = _persist_impression_event_with_cursor(cur, event)
+                    inserted_events += int(inserted_impression > 0)
+                elif isinstance(event, WatchEvent):
+                    inserted_watch = _persist_watch_event_with_cursor(cur, event)
+                    inserted_events += int(inserted_watch)
+                else:
+                    raise ValueError(f"Unsupported event type in batch: {type(event).__name__}")
+    return inserted_events
 
 
 def persist_watch_event_and_update_features(
@@ -380,14 +428,13 @@ def persist_watch_event_and_update_features(
     history_size: int = STREAM_FEATURE_HISTORY_SIZE,
 ) -> dict:
     history_size = max(int(history_size), 1)
-    context_jsonb = _context_to_jsonb(event.context)
     event_type, weight = _watch_signal_to_event(event)
     ts_seconds = normalize_unix_ts_seconds(event.ts_ms)
     stream_event_id = f"watch-{event.event_id}"
 
     with transaction() as conn:
         with conn.cursor() as cur:
-            inserted_watch = event_log_repository.insert_watch_event(cur, event, context_jsonb)
+            inserted_watch = _persist_watch_event_with_cursor(cur, event)
             if not inserted_watch:
                 return {
                     "inserted_watch": False,
@@ -395,14 +442,6 @@ def persist_watch_event_and_update_features(
                     "feature_event_type": event_type,
                     "feature_weight": weight,
                 }
-
-            _enqueue_outbox_event(
-                cur,
-                event_id=event.event_id,
-                event_type="watch",
-                kafka_key=event.user_id,
-                payload=_event_payload(event),
-            )
 
             feature_applied = feature_repository.apply_feedback_event(
                 cur,
@@ -477,6 +516,197 @@ def process_watch_event_from_stream(
                 "feature_event_type": event_type,
                 "feature_weight": weight,
             }
+
+
+def record_feature_consumer_dlq_event(
+    *,
+    source_topic: str,
+    source_partition: int,
+    source_offset: int,
+    kafka_key: str,
+    payload: Any,
+    error_text: str,
+    retry_count: int,
+) -> int:
+    safe_payload = payload if isinstance(payload, dict) else {"raw_payload": payload}
+    safe_error_text = (error_text or "unknown_error").strip()[:4000]
+    safe_retry_count = max(int(retry_count), 1)
+
+    with transaction() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                _UPSERT_FEATURE_CONSUMER_DLQ_SQL,
+                (
+                    source_topic,
+                    int(source_partition),
+                    int(source_offset),
+                    str(kafka_key),
+                    Jsonb(safe_payload),
+                    safe_error_text,
+                    safe_retry_count,
+                ),
+            )
+            row = cur.fetchone() or {}
+    return int(row.get("id") or 0)
+
+
+def _normalize_json_payload(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return {"raw_payload": value}
+        if isinstance(parsed, dict):
+            return parsed
+        return {"raw_payload": parsed}
+    return {"raw_payload": value}
+
+
+def get_feature_consumer_dlq_snapshot() -> dict:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT
+                    COUNT(*) FILTER (WHERE status = 'pending') AS pending,
+                    COUNT(*) FILTER (WHERE status = 'replayed') AS replayed,
+                    COALESCE(MAX(retry_count), 0) AS max_retry_count
+                FROM feature_consumer_dlq
+                """
+            )
+            counters = cur.fetchone() or {}
+            cur.execute(
+                """
+                SELECT CAST(EXTRACT(EPOCH FROM (now() - MIN(first_failed_at))) * 1000 AS BIGINT) AS oldest_pending_ms
+                FROM feature_consumer_dlq
+                WHERE status = 'pending'
+                """
+            )
+            lag_row = cur.fetchone() or {}
+
+    return {
+        "pending": int(counters.get("pending") or 0),
+        "replayed": int(counters.get("replayed") or 0),
+        "max_retry_count": int(counters.get("max_retry_count") or 0),
+        "oldest_pending_ms": int(lag_row.get("oldest_pending_ms") or 0),
+    }
+
+
+def list_feature_consumer_dlq_events(
+    *,
+    limit: int = 100,
+    topic: Optional[str] = None,
+    statuses: Optional[list[str]] = None,
+) -> list[dict]:
+    limit = max(int(limit), 1)
+    requested_statuses = statuses or ["pending"]
+    normalized_statuses = [str(status).strip().lower() for status in requested_statuses if str(status).strip()]
+    if not normalized_statuses:
+        normalized_statuses = ["pending"]
+
+    allowed_statuses = {"pending", "replayed"}
+    invalid_statuses = [status for status in normalized_statuses if status not in allowed_statuses]
+    if invalid_statuses:
+        raise ValueError(f"Unsupported DLQ statuses: {', '.join(invalid_statuses)}")
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            if topic:
+                cur.execute(
+                    """
+                    SELECT
+                        id,
+                        source_topic,
+                        source_partition,
+                        source_offset,
+                        kafka_key,
+                        payload,
+                        error_text,
+                        retry_count,
+                        replay_count,
+                        last_replay_error,
+                        status,
+                        first_failed_at,
+                        last_failed_at,
+                        replayed_at
+                    FROM feature_consumer_dlq
+                    WHERE status = ANY(%s)
+                      AND source_topic = %s
+                    ORDER BY id ASC
+                    LIMIT %s
+                    """,
+                    (normalized_statuses, topic, limit),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT
+                        id,
+                        source_topic,
+                        source_partition,
+                        source_offset,
+                        kafka_key,
+                        payload,
+                        error_text,
+                        retry_count,
+                        replay_count,
+                        last_replay_error,
+                        status,
+                        first_failed_at,
+                        last_failed_at,
+                        replayed_at
+                    FROM feature_consumer_dlq
+                    WHERE status = ANY(%s)
+                    ORDER BY id ASC
+                    LIMIT %s
+                    """,
+                    (normalized_statuses, limit),
+                )
+            rows = cur.fetchall()
+
+    result: list[dict] = []
+    for row in rows:
+        row_dict = dict(row)
+        row_dict["payload"] = _normalize_json_payload(row_dict.get("payload"))
+        result.append(row_dict)
+    return result
+
+
+def mark_feature_consumer_dlq_replayed(dlq_id: int) -> None:
+    with transaction() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE feature_consumer_dlq
+                SET
+                    status = 'replayed',
+                    replay_count = replay_count + 1,
+                    replayed_at = now(),
+                    last_replay_error = NULL,
+                    updated_at = now()
+                WHERE id = %s
+                """,
+                (int(dlq_id),),
+            )
+
+
+def mark_feature_consumer_dlq_replay_failed(dlq_id: int, *, error_text: str) -> None:
+    with transaction() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE feature_consumer_dlq
+                SET
+                    status = 'pending',
+                    replay_count = replay_count + 1,
+                    last_replay_error = %s,
+                    updated_at = now()
+                WHERE id = %s
+                """,
+                ((error_text or "unknown_replay_error")[:4000], int(dlq_id)),
+            )
 
 
 def claim_outbox_events(limit: int = 100, lease_sec: int = 30) -> list[dict]:

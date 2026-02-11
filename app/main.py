@@ -17,6 +17,7 @@ if __package__:
         get_outbox_snapshot,
         init_db,
         ping_db,
+        persist_event_batch,
         persist_impression_event,
         persist_watch_event,
     )
@@ -53,6 +54,7 @@ else:  # pragma: no cover - fallback for direct script execution
         get_outbox_snapshot,
         init_db,
         ping_db,
+        persist_event_batch,
         persist_impression_event,
         persist_watch_event,
     )
@@ -278,14 +280,14 @@ def healthcheck():
 
 @app.get("/readyz")
 async def readiness_check():
-    db_ready = ping_db()
+    db_ready = await asyncio.to_thread(ping_db)
     if not store.cache_ready():
         store.start_cache()
     cache_ready = store.cache_ready()
     set_api_check_status(scope="readyz", check="db", ok=db_ready)
     set_api_check_status(scope="readyz", check="online_cache", ok=cache_ready)
     ready = db_ready and cache_ready
-    outbox_snapshot = _safe_outbox_snapshot() if db_ready else None
+    outbox_snapshot = await asyncio.to_thread(_safe_outbox_snapshot) if db_ready else None
     if outbox_snapshot and isinstance(outbox_snapshot, dict) and "pending" in outbox_snapshot:
         set_outbox_backlog_metrics(outbox_snapshot)
 
@@ -352,11 +354,11 @@ def rank_candidates(
 
 
 async def _persist_impression(evt: ImpressionEvent) -> int:
-    return persist_impression_event(evt)
+    return await asyncio.to_thread(persist_impression_event, evt)
 
 
 async def _persist_watch(evt: WatchEvent) -> bool:
-    return persist_watch_event(evt)
+    return await asyncio.to_thread(persist_watch_event, evt)
 
 
 def _with_server_received_ts(event: ImpressionEvent | WatchEvent) -> ImpressionEvent | WatchEvent:
@@ -478,14 +480,15 @@ async def get_reco(
     safe_user_agent = user_agent[:512] if user_agent else None
 
     retrieval_started = time.perf_counter()
-    candidates, user_history = retrieve_candidates_and_history(
+    candidates, user_history = await asyncio.to_thread(
+        retrieve_candidates_and_history,
         user_id,
         max(k * 20, 200),
     )
     observe_reco_stage_latency("retrieval", (time.perf_counter() - retrieval_started) * 1000.0)
 
     ranking_started = time.perf_counter()
-    items = rank_candidates(user_id, candidates, k, user_history)
+    items = await asyncio.to_thread(rank_candidates, user_id, candidates, k, user_history)
     observe_reco_stage_latency("ranking", (time.perf_counter() - ranking_started) * 1000.0)
 
     if x_autolog_impressions and items:
@@ -529,16 +532,9 @@ async def get_reco(
 
 @app.post("/log/batch")
 async def log_batch(batch: EventBatch):
-    inserted_events = 0
+    payload_events = [_with_server_received_ts(event) for event in batch.events]
     try:
-        for event in batch.events:
-            payload = _with_server_received_ts(event)
-            if event.event_type == "impression":
-                inserted_impression = await _persist_impression(payload)
-                inserted_events += int(inserted_impression > 0)
-            else:
-                inserted_watch = await _persist_watch(payload)
-                inserted_events += int(inserted_watch)
+        inserted_events = await asyncio.to_thread(persist_event_batch, payload_events)
     except Exception as exc:
         raise HTTPException(status_code=503, detail="failed to persist batch events") from exc
 

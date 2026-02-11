@@ -70,6 +70,12 @@ python src/check_guardrails.py \
   --output-json guardrail-report.json
 ```
 
+### Replay feature-consumer DLQ
+```bash
+python src/replay_feature_consumer_dlq.py --limit 100 --output-json replay-feature-dlq.json
+python src/replay_feature_consumer_dlq.py --topic recsys.watches.v1 --status pending --limit 100
+```
+
 ## API Highlights
 - `GET /healthz`: liveness + subsystem snapshots.
 - `GET /readyz`: readiness gate (DB + cache).
@@ -80,6 +86,14 @@ python src/check_guardrails.py \
 - `GET /contract`: KPI/SLA contract snapshot.
 
 All HTTP responses include `X-Request-ID` and `X-Correlation-ID` headers.
+
+`/log/batch` is transactional: the request is applied atomically (all events are persisted or none).
+
+Feature consumer protects partitions from poison messages with per-message retry cap:
+- `FEATURE_CONSUMER_MAX_RETRIES_PER_MESSAGE` (default `5`)
+- after limit is reached, event is moved to Postgres DLQ (`feature_consumer_dlq`) and counted via:
+  - `reco_feature_consumer_processed_total{status="dlq"}`
+  - `reco_feature_consumer_dlq_events_total{outcome="stored"}`
 
 ## CI/CD
 `/.github/workflows/ci.yml` runs:

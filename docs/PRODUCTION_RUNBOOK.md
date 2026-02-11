@@ -54,12 +54,15 @@ Minimum panels:
 - Readiness/health status: `reco_api_check_status`.
 - Outbox reliability: `reco_outbox_backlog_events`, `reco_outbox_backlog_oldest_lag_ms`, `reco_outbox_relay_failed_total`, `reco_outbox_relay_errors_total`.
 - Consumer progress: `reco_feature_consumer_processed_total`, `reco_feature_consumer_partition_lag`, `reco_feature_consumer_errors_total`.
+- Consumer poison-message handling: `reco_feature_consumer_processed_total{status="dlq"}`, `reco_feature_consumer_dlq_events_total`, `reco_feature_consumer_dlq_backlog`, `reco_feature_consumer_dlq_oldest_pending_ms`.
 
 ## 5. Suggested Alerts
 - `readyz` down > 2m.
 - `reco_outbox_backlog_events{status="dead"} > 0` for 5m.
 - `reco_outbox_backlog_oldest_lag_ms > 120000` for 5m.
 - `reco_feature_consumer_partition_lag > 5000` for 10m.
+- `increase(reco_feature_consumer_processed_total{status="dlq"}[10m]) > 0`.
+- `reco_feature_consumer_dlq_oldest_pending_ms > 300000` for 10m.
 - `rate(reco_api_requests_total{status_family="5xx"}[5m]) / rate(reco_api_requests_total[5m]) > 0.01`.
 
 ## 6. Routine Operations
@@ -67,6 +70,12 @@ Minimum panels:
 ```bash
 python src/replay_outbox.py --limit 1000
 python src/replay_outbox.py --topic recsys.watches.v1 --limit 1000
+```
+
+### Replay feature-consumer DLQ
+```bash
+python src/replay_feature_consumer_dlq.py --limit 100
+python src/replay_feature_consumer_dlq.py --topic recsys.watches.v1 --status pending --limit 100
 ```
 
 ### Schema checks
@@ -81,3 +90,4 @@ docker compose stop
 ```
 The API drains outstanding background tasks up to `RECO_BACKGROUND_SHUTDOWN_TIMEOUT_SEC`.
 Relay/consumer use configurable shutdown timeouts and stop processing cleanly.
+Feature consumer retries the same message up to `FEATURE_CONSUMER_MAX_RETRIES_PER_MESSAGE`; after that it stores the message in `feature_consumer_dlq` and continues partition progress.

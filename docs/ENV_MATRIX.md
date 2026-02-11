@@ -52,6 +52,7 @@
 |---|---|---|
 | `FEATURE_CONSUMER_POLL_TIMEOUT_MS` | `1000` | Kafka poll timeout. |
 | `FEATURE_CONSUMER_MAX_POLL_RECORDS` | `500` | Poll batch max. |
+| `FEATURE_CONSUMER_MAX_RETRIES_PER_MESSAGE` | `5` | Max retries for the same topic/partition/offset before moving event to DLQ. |
 | `FEATURE_CONSUMER_STARTUP_MAX_RETRIES` | `0` | `0` means retry indefinitely. |
 | `FEATURE_CONSUMER_STARTUP_BACKOFF_SEC` | `2` | Startup retry backoff base. |
 | `FEATURE_CONSUMER_SHUTDOWN_TIMEOUT_SEC` | `20` | Shutdown timeout for consumer stop. |

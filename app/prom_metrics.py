@@ -162,6 +162,23 @@ FEATURE_CONSUMER_ERRORS_TOTAL = Counter(
     labelnames=("stage",),
 )
 
+FEATURE_CONSUMER_DLQ_EVENTS_TOTAL = Counter(
+    "reco_feature_consumer_dlq_events_total",
+    "Feature consumer DLQ events by outcome.",
+    labelnames=("outcome",),
+)
+
+FEATURE_CONSUMER_DLQ_BACKLOG = Gauge(
+    "reco_feature_consumer_dlq_backlog",
+    "Feature consumer DLQ backlog count by status.",
+    labelnames=("status",),
+)
+
+FEATURE_CONSUMER_DLQ_OLDEST_PENDING_MS = Gauge(
+    "reco_feature_consumer_dlq_oldest_pending_ms",
+    "Age of the oldest pending feature consumer DLQ event.",
+)
+
 
 def observe_reco_request(latency_ms: float, status_code: int) -> None:
     status_family = f"{max(status_code, 0) // 100}xx"
@@ -217,6 +234,16 @@ def observe_outbox_relay_error(stage: str) -> None:
 
 def observe_feature_consumer_error(stage: str) -> None:
     FEATURE_CONSUMER_ERRORS_TOTAL.labels(stage=stage).inc()
+
+
+def observe_feature_consumer_dlq(outcome: str) -> None:
+    FEATURE_CONSUMER_DLQ_EVENTS_TOTAL.labels(outcome=outcome).inc()
+
+
+def set_feature_consumer_dlq_backlog(snapshot: dict) -> None:
+    for status in ("pending", "replayed"):
+        FEATURE_CONSUMER_DLQ_BACKLOG.labels(status=status).set(float(snapshot.get(status, 0) or 0))
+    FEATURE_CONSUMER_DLQ_OLDEST_PENDING_MS.set(float(snapshot.get("oldest_pending_ms", 0) or 0))
 
 
 def prometheus_payload() -> Optional[bytes]:

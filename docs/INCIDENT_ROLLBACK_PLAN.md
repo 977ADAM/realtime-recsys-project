@@ -40,8 +40,13 @@ curl -fsS http://localhost:8080/readyz | jq
 
 ### 3. Consumer lag growth
 - Check Kafka consumer group and `reco_feature_consumer_partition_lag`.
+- Check `reco_feature_consumer_processed_total{status="dlq"}` and `reco_feature_consumer_dlq_backlog{status="pending"}`.
 - Verify DB latency and lock timeout errors.
-- Mitigation: restart `feature-consumer`, temporarily increase poll batch/timeout.
+- Mitigation: restart `feature-consumer`, temporarily increase poll batch/timeout, tune `FEATURE_CONSUMER_MAX_RETRIES_PER_MESSAGE`.
+- After root cause fix, replay DLQ:
+  ```bash
+  python src/replay_feature_consumer_dlq.py --status pending --limit 100
+  ```
 
 ## Rollback Strategy
 ### Application rollback
